@@ -228,6 +228,22 @@ func shutdownDevSpace(page playwright.Page) bool {
 	return false
 }
 
+// pickFreeDevSpaceLink 从实践中心页面挑「免费」的前往 DevSpace 入口。
+// 页面上有多个同名链接：第一个带 dc/dc_sign 签名会进收费的 harmony-practice-center
+// （创建容器、持续烧核时）；带 utm_source=officeagent 的是免费体验入口。
+func pickFreeDevSpaceLink(page playwright.Page) playwright.Locator {
+	all := page.Locator(`a:has-text("前往AI DevSpace实践")`)
+	n, _ := all.Count()
+	for i := 0; i < n; i++ {
+		el := all.Nth(i)
+		href, _ := el.GetAttribute("href")
+		if href != "" && strings.Contains(href, "officeagent") {
+			return el
+		}
+	}
+	return all.Last() // 兜底：最后一个通常也是 officeagent，避开第一个带签名的
+}
+
 // clipRunes 按 rune 截断，避免中文被截成半个字。
 func clipRunes(s string, n int) string {
 	r := []rune(s)

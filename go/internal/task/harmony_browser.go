@@ -679,7 +679,8 @@ func RunDevSpaceBrowser(sess *huawei.Session, headless bool) (map[string]any, er
 	}
 	page.WaitForTimeout(8000)
 
-	loc := page.Locator(`a:has-text("前往AI DevSpace实践")`).First()
+	// 优先点免费入口（officeagent），避开第一个带 dc_sign 的收费环境链接
+	loc := pickFreeDevSpaceLink(page)
 	clicked := false
 	if n, _ := loc.Count(); n > 0 {
 		if err := loc.Click(playwright.LocatorClickOptions{Timeout: playwright.Float(8000)}); err == nil {
