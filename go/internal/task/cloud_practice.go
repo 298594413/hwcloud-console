@@ -103,15 +103,44 @@ func RunCloudPractice(headless bool) (map[string]any, error) {
 	// 等环境就绪。
 	// 判据：「环境准备中」消失，且出现「剩余核时」或「当前环境运行中」。
 	//
-	// 2026-11-23 实测：新平台「每周实践一次鸿蒙案例」要求更重的流程
-	// （项目创建 + git 仓拉取 + 编译打包），DevSpace 容器首次拉起明显变慢，
-	// 6 分钟会超时。这里放宽到 12 分钟，并在超时时明确标注「可能需要人工」，
-	// 不把「环境慢」误报成「任务失败」。
+	// 2026-11-23 实测（周常真实失败原因）：
+	//   环境其实在正常创建，但 DevSpace 弹出了「版本有更新，建议升级」对话框，
+	//   正文是「环境准备中，请勿关闭窗口...」+ 升级弹窗的「确认/取消」。
+	//   这个弹窗不处理会一直盖住页面，等待循环只能看到「环境准备中」，
+	//   最后误报成「环境 12 分钟未就绪」。
+	//   所以每轮先尝试关掉「取消」/「稍后」/「关闭」，再判断状态。
 	ready := false
 	deadline := time.Now().Add(12 * time.Minute)
 	lastText := ""
+	dismissedUpgrade := false
 	for time.Now().Before(deadline) {
 		page.WaitForTimeout(6000)
+		// 处理升级弹窗：点「取消」比点「确认」安全（不在任务里触发版本升级）。
+		if !dismissedUpgrade {
+			for _, label := range []string{"取消", "稍后", "以后再说", "关闭"} {
+				for _, sel := range []string{
+					`[class*="dialog"] button:has-text("%s")`,
+					`[class*="modal"] button:has-text("%s")`,
+					`button:has-text("%s")`,
+				} {
+					loc := page.Locator(fmt.Sprintf(sel, label))
+					if n, _ := loc.Count(); n == 0 {
+						continue
+					}
+					if vis, _ := loc.First().IsVisible(); !vis {
+						continue
+					}
+					if err := loc.First().Click(playwright.LocatorClickOptions{Timeout: playwright.Float(4000)}); err == nil {
+						dismissedUpgrade = true
+						time.Sleep(2 * time.Second)
+						break
+					}
+				}
+				if dismissedUpgrade {
+					break
+				}
+			}
+		}
 		b, err := page.Locator("body").InnerText()
 		if err != nil {
 			continue
@@ -136,10 +165,11 @@ func RunCloudPractice(headless bool) (map[string]any, error) {
 		msg = "环境已就绪，云端实践已触发"
 	}
 	out := map[string]any{
-		"ok":        ready,
-		"agreed":    agreed,
-		"env_ready": ready,
-		"msg":       msg,
+		"ok":               ready,
+		"agreed":           agreed,
+		"env_ready":        ready,
+		"dismissed_upgrade": dismissedUpgrade,
+		"msg":              msg,
 	}
 	if !ready && lastText != "" {
 		out["page_hint"] = clipRunes(lastText, 300)
