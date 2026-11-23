@@ -73,7 +73,9 @@ func RunCloudPractice(headless bool) (map[string]any, error) {
 	// 「是否同意将您的临时访问凭据(AK/SK) 同步至 AI 开发者空间环境」，
 	// 环境根本不会开始创建。
 	agreed := false
-	for _, label := range []string{"同意", "同意并继续"} {
+	// 2026-11-23 实测：新版页面会弹「CodeArts代码智能体服务声明」，
+	// 按钮是「立即开通」，不点就一直卡在「环境准备中」。加入匹配。
+	for _, label := range []string{"同意", "同意并继续", "立即开通"} {
 		for _, sel := range []string{
 			`button:has-text("%s")`,
 			`.el-button:has-text("%s")`,

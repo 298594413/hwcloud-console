@@ -194,6 +194,11 @@ func RunGalleryPublish(opts GalleryOptions) (*GalleryResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("等待 GitCode 登录链接失败: %v", err)
 	}
+	if loginURL == "__PUBLISHED__" {
+		// AI 跳过授权直接发布成功，跳到结果解析。
+		logStep("3/4 已直接发布，跳过授权/选活动")
+		goto published
+	}
 	logStep("3/4 拿到登录链接: %s", loginURL)
 
 	if err := autoGitCodeLogin(ctx, loginURL); err != nil {
@@ -236,6 +241,7 @@ func RunGalleryPublish(opts GalleryOptions) (*GalleryResult, error) {
 	}
 	logStep("4/4 完成：作品已发布")
 
+published:
 	res := parseGalleryResult(frameTextOf(shell))
 	if res.WorkID == "" {
 		return nil, fmt.Errorf("发布流程结束但未解析到 workId")
@@ -1182,6 +1188,13 @@ func waitForOAuthURL(page playwright.Page, shell playwright.Frame, deadline time
 
 		txt := frameTextOf(shell)
 		busy := aiIsBusy(shell)
+		// AI 可能用已存的 GitCode 凭据直接完成发布，根本不输出登录链接。
+		// 检测到发布成功信号就返回特殊值，主流程跳过授权+选活动直接收尾。
+		if strings.Contains(txt, "workId=") || strings.Contains(txt, "发布成功") ||
+			strings.Contains(txt, "#status=201") || strings.Contains(txt, "积分领取请求已提交") {
+			logStep("  检测到作品已直接发布成功（无需 GitCode 授权）")
+			return "__PUBLISHED__", nil
+		}
 		all := re.FindAllString(txt, -1)
 		if len(all) > 0 && !busy {
 			lastURL = all[len(all)-1]
