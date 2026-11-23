@@ -102,15 +102,21 @@ func RunCloudPractice(headless bool) (map[string]any, error) {
 
 	// 等环境就绪。
 	// 判据：「环境准备中」消失，且出现「剩余核时」或「当前环境运行中」。
-	// 实测创建容器约 30~60 秒。
+	//
+	// 2026-11-23 实测：新平台「每周实践一次鸿蒙案例」要求更重的流程
+	// （项目创建 + git 仓拉取 + 编译打包），DevSpace 容器首次拉起明显变慢，
+	// 6 分钟会超时。这里放宽到 12 分钟，并在超时时明确标注「可能需要人工」，
+	// 不把「环境慢」误报成「任务失败」。
 	ready := false
-	deadline := time.Now().Add(6 * time.Minute)
+	deadline := time.Now().Add(12 * time.Minute)
+	lastText := ""
 	for time.Now().Before(deadline) {
 		page.WaitForTimeout(6000)
 		b, err := page.Locator("body").InnerText()
 		if err != nil {
 			continue
 		}
+		lastText = b
 		if strings.Contains(b, "环境准备中") {
 			continue
 		}
@@ -125,14 +131,27 @@ func RunCloudPractice(headless bool) (map[string]any, error) {
 		page.WaitForTimeout(20000)
 	}
 
-	msg := "环境未在 6 分钟内就绪"
+	msg := "环境未在 12 分钟内就绪（DevSpace 侧较慢，可稍后重试）"
 	if ready {
 		msg = "环境已就绪，云端实践已触发"
 	}
-	return map[string]any{
+	out := map[string]any{
 		"ok":        ready,
 		"agreed":    agreed,
 		"env_ready": ready,
 		"msg":       msg,
-	}, nil
+	}
+	if !ready && lastText != "" {
+		out["page_hint"] = clipRunes(lastText, 300)
+	}
+	return out, nil
+}
+
+// clipRunes 按 rune 截断，避免中文被截成半个字。
+func clipRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }

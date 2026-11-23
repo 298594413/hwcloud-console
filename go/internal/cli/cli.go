@@ -37,6 +37,7 @@ func usage() {
   drafts         列出草稿
   delete         删除已发布文章（--draft 删草稿）
   devspace       上报「体验 AI DevSpace」行为
+  notify         仅通知已结束任务（只查询积分，不执行业务）
   daily          一键日常（签到+DevSpace+发文章+鸿蒙浏览+鸿蒙Star）
   weekly         一键周常（云实验+Issue+Star+活动+赛事+鸿蒙云端实践）
   status         实践中心账号与 GitCode 绑定状态
@@ -276,6 +277,35 @@ func Main(args []string) int {
 	rest := args[2:]
 
 	switch cmd {
+	case "notify":
+		fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
+		name := fs.String("task", "", "已结束的任务类型")
+		account := fs.String("account", "all", "账号 ID 或 all")
+		resultFile := fs.String("result", "-", "结果 JSON 文件，- 表示 stdin")
+		elapsed := fs.Duration("elapsed", 0, "业务耗时")
+		if err := fs.Parse(rest); err != nil {
+			return 2
+		}
+		var result map[string]any
+		var decoder *json.Decoder
+		if *resultFile == "-" {
+			decoder = json.NewDecoder(os.Stdin)
+		} else {
+			f, err := os.Open(*resultFile)
+			if err != nil {
+				return fail(fmt.Errorf("无法打开结果文件"))
+			}
+			defer f.Close()
+			decoder = json.NewDecoder(f)
+		}
+		if err := decoder.Decode(&result); err != nil || result == nil {
+			return fail(fmt.Errorf("结果必须是 JSON 对象"))
+		}
+		if err := web.NotifyCompletedForCLI(*name, *account, result, *elapsed); err != nil {
+			return fail(err)
+		}
+		printJSON(map[string]any{"ok": true, "msg": "通知处理已结束；平台接受状态见 service.log"})
+		return 0
 	case "login":
 		fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 		timeout := fs.Int("timeout", 600, "等待登录秒数")
@@ -928,10 +958,16 @@ func Main(args []string) int {
 			return 2
 		}
 		ensureSession()
+		started := time.Now()
 		result, err := task.RunGalleryPublish(task.GalleryOptions{
 			Prompt:  *prompt,
 			Timeout: *timeout,
 		})
+		notice := map[string]any{"ok": err == nil}
+		if err != nil {
+			notice["error"] = "月度任务失败"
+		}
+		web.NotifyCLIResult("gallery-publish", config.AccountID(), notice, time.Since(started))
 		if err != nil {
 			return fail(err)
 		}

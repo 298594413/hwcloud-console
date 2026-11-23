@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"hwcloud/internal/huawei"
@@ -155,7 +156,38 @@ func HohBind(gitcodeUser string) (map[string]any, error) {
 	return out, nil
 }
 
-// TrackDevSpace 上报「体验 AI DevSpace」行为。
+// HohTaskStatus 读取实践中心首页里各任务卡片的完成状态。
+//
+// 为什么需要它：成长中心（grow）和个人任务列表的 is_finish 依赖激励服务
+// 异步结算，可能滞后；而实践中心首页是任务执行侧自己渲染的状态，
+// 对「Star Grape」「Star 实践中心代码仓」这类任务是更及时的证据。
+//
+// 返回 map[taskID]finished，taskID 形如 taskGrapeStar / taskStar / taskIssue。
+func HohTaskStatus() (map[string]bool, error) {
+	session, err := huawei.New("")
+	if err != nil {
+		return nil, err
+	}
+	data, err := hohRequest(session, http.MethodGet, "/", nil)
+	if err != nil {
+		return nil, err
+	}
+	html := string(data)
+	out := map[string]bool{}
+	// 每个卡片形如：id="taskGrapeStar" ... <div class="task-status">...已完成</div>
+	re := regexp.MustCompile(`(?s)id="(task[A-Za-z]+)".*?class="task-status"[^>]*>(.*?)</div>`)
+	for _, m := range re.FindAllStringSubmatch(html, -1) {
+		id := m[1]
+		text := stripTags(m[2])
+		out[id] = strings.Contains(text, "已完成")
+	}
+	return out, nil
+}
+
+// stripTags 去掉 HTML 标签，保留文本。
+func stripTags(s string) string {
+	return regexp.MustCompile(`<[^>]+>`).ReplaceAllString(s, "")
+}
 func TrackDevSpace() (map[string]any, error) {
 	session, err := huawei.New("")
 	if err != nil {

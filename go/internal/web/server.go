@@ -620,6 +620,13 @@ func (s *Server) probeAccountFull(id string) (bool, string, float64, int) {
 			beans = beansCached
 			return nil
 		}
+		// 2026-11-23：积分改从新版成长中心取（旧 bonus-beans 已下线）。
+		if gs, err := huawei.NewGrowSession(); err == nil {
+			if n, err := gs.Points(); err == nil {
+				beans = n
+				return nil
+			}
+		}
 		if sess, err := huawei.New(""); err == nil {
 			beans = sess.Beans()
 		}
@@ -1312,7 +1319,7 @@ func (s *Server) notifyJobDone(n *jobNotify) {
 
 	status := "成功"
 	event := "task_done"
-	if n.ErrMsg != "" {
+	if resultFailed(n.Result) || n.ErrMsg != "" {
 		status = "失败"
 		event = "task_fail"
 	}
@@ -1343,12 +1350,16 @@ func (s *Server) notifyJobDone(n *jobNotify) {
 		if bl.OK {
 			fmt.Fprintf(&b, "%d", bl.Beans)
 		} else {
-			b.WriteString("—")
+			b.WriteString("—（未知）")
 		}
 		b.WriteString(LF)
 	}
 	if len(beanLines) > 1 && beanAny {
-		fmt.Fprintf(&b, "  合计：%d", beanTotal)
+		if allBeansKnown(beanLines) {
+			fmt.Fprintf(&b, "  合计：%d", beanTotal)
+		} else {
+			fmt.Fprintf(&b, "  已知部分合计：%d（含未知账号）", beanTotal)
+		}
 		b.WriteString(LF)
 	}
 
@@ -1363,23 +1374,28 @@ func (s *Server) notifyJobDone(n *jobNotify) {
 	title := fmt.Sprintf("【hwcloud】%s 积分 %s", n.Label, status)
 	if beanAny {
 		if len(beanLines) == 1 {
-			title = fmt.Sprintf("【hwcloud】%s 积分 %d", beanLines[0].Label, beanLines[0].Beans)
+			title = fmt.Sprintf("【hwcloud】%s 积分 %d", beanLines[0].Label, beanLines[0].Beans) + "（" + status + "）"
 		} else {
-			title = fmt.Sprintf("【hwcloud】积分合计 %d（%s）", beanTotal, n.Label)
+			if allBeansKnown(beanLines) {
+				title = fmt.Sprintf("【hwcloud】积分合计 %d（%s %s）", beanTotal, n.Label, status)
+			} else {
+				title = fmt.Sprintf("【hwcloud】已知部分积分 %d（%s %s）", beanTotal, n.Label, status)
+			}
 		}
 	}
 	if err := sendPushPlus(cfg.Token, title, b.String(), cfg.Topic); err != nil {
 		svcLog("[pushplus] 推送失败（%s）：%v", event, err)
 		return
 	}
-	svcLog("[pushplus] 已推送（%s）：%s", event, title)
+	svcLog("[pushplus] 平台已接受（%s）：%s", event, title)
 }
 
 // pushWorthyTask 判断某类任务结束后是否值得推送。
 //
 // 只有「跑一轮会实打实加积分」的任务才推：
-//   daily / weekly / gallery-publish / cloud-practice  → 推
-//   keepalive / tasks / beans / session / check 等      → 不推
+//
+//	daily / weekly / gallery-publish / cloud-practice  → 推
+//	keepalive / tasks / beans / session / check 等      → 不推
 //
 // 批量任务的名字是 startBatchJob 传进来的同一个 name（daily/weekly/...），
 // 所以这里按 name 判断即可，不用区分单账号还是全部账号。
@@ -1406,15 +1422,32 @@ type beanLine struct {
 // 取不到积分的账号（离线/接口失败）标记 OK=false，正文里显示「—」，
 // 不参与总数 —— 显示 0 会让人误以为积分归零。
 func (s *Server) pushBeanLines(n *jobNotify) (lines []beanLine, total int, anyOK bool) {
-	if n.Account != "" && n.Account != batchAllID {
+	if n.Account != batchAllID {
 		label := accountLabelForNotify(s, n.Account)
+		if label == "" {
+			label = "默认账号"
+		}
 		if beans, ok := s.beansForNotify(n.Account); ok {
 			return []beanLine{{Label: label, Beans: beans, OK: true}}, beans, true
 		}
 		return []beanLine{{Label: label, OK: false}}, 0, false
 	}
 	// 全部账号：逐个列
+	selected := map[string]bool{}
+	if raw, err := json.Marshal(n.Result["accounts"]); err == nil {
+		var accounts []struct {
+			ID string `json:"id"`
+		}
+		if json.Unmarshal(raw, &accounts) == nil {
+			for _, account := range accounts {
+				selected[account.ID] = true
+			}
+		}
+	}
 	for _, a := range s.store.List() {
+		if len(selected) > 0 && !selected[a.ID] {
+			continue
+		}
 		label := a.ID
 		if a.Remark != "" {
 			label = a.Remark
@@ -1430,46 +1463,27 @@ func (s *Server) pushBeanLines(n *jobNotify) (lines []beanLine, total int, anyOK
 	return lines, total, anyOK
 }
 
-// beansForNotify 取某账号的积分，优先用缓存，缓存没有就现查一次。
+// beansForNotify 只现查任务后的积分；失败显示未知，不回退到旧缓存。
 //
-// 为什么要现查：面板刚启动或用户没点过「刷新」时，probeCache 是空的，
-// 直接读缓存会得到一堆 -1，推送里全是「—」，等于没通知。
-//
-// 为什么用 withAccountTry 而不是 withAccount：
-//   推送是在 finishJob 之后异步跑的，此时任务已结束、锁应该空闲；
-//   但万一有别的账号在跑长任务，这里不能干等 —— 拿不到锁就当查不到，
-//   显示「—」比把推送卡住几十秒好。
+// 2026-11-23 起优先走新版成长中心 /user/info 的 total_points。
+// 旧 devdata 积分接口已下线（403 not login），若新站取不到再尝试旧会话，
+// 两者都失败才标记「未知」。
 func (s *Server) beansForNotify(id string) (int, bool) {
-	if snap, ok := s.cachedProbe(id); ok && snap.Beans >= 0 {
-		return snap.Beans, true
+	dir := filepath.Join(config.Root(), "accounts", id, "state")
+	if id == "" {
+		dir = filepath.Join(config.Root(), "state")
 	}
-	var beans int
-	got := false
-	ok := s.withAccountTry(id, func() any {
-		sess, err := huawei.New("")
-		if err != nil {
-			return nil
+	if sess, err := newGrowNotifySession(dir); err == nil {
+		if n, err := sess.Points(); err == nil {
+			return n, true
 		}
+	}
+	if sess, err := newNotifySession(dir); err == nil {
 		if n, err := sess.BeansE(); err == nil {
-			beans = n
-			got = true
+			return n, true
 		}
-		return nil
-	})
-	if !ok || !got {
-		return 0, false
 	}
-	// 顺手写回缓存，面板下次刷新能直接用
-	s.probeMu.Lock()
-	if s.probeCache == nil {
-		s.probeCache = map[string]probeSnapshot{}
-	}
-	snap := s.probeCache[id]
-	snap.Beans = beans
-	snap.At = time.Now()
-	s.probeCache[id] = snap
-	s.probeMu.Unlock()
-	return beans, true
+	return 0, false
 }
 
 // accountLabelForNotify 把账号 ID 换成「备注(手机号)」，没有备注就用手机号。
@@ -1500,23 +1514,31 @@ const batchAllID = "all"
 //   - 步骤级：某个子任务已完成就跳过那一步，其余继续
 //   - 账号级：整组都完成就一个浏览器都不开（快得多，也不触发风控）
 //
-// 匹配串来自成长中心的真实任务标题（实测 2026-11-09）。
-// 用 Contains 而不是全等：标题里可能带 emoji 或前后缀变化。
+// 匹配串来自成长中心的真实 task_tag（2026-11-23 新版接口实测）。
+//
+// 新清单（10 项）：
+//
+//	DAILY   每日签到 / 体验AI DevSpace / 每日浏览一个鸿蒙案例 / Star一个鸿蒙案例代码仓
+//	WEEKLY  每周Star一个Agent代码仓 / 每周提Issue / 每周实践一次鸿蒙案例
+//	MONTHLY 在开发者作品展览馆中发布作品
+//	LIMIT   Star开源项目Grape代码仓 / 报名华为ICT大赛创新赛
+//
+// 注意：新清单**没有「每日发布文章」**，旧 blog 项已移除，
+// 否则整号预检永远判「没做完」，每天仍会白跑发文章。
 var batchMustDo = map[string][]string{
 	"daily": {
-		"发布文章",       // 每日发布文章 (+60)
-		"体验AI DevSpace", // 每日体验 AI DevSpace (+30)
-		"浏览一个鸿蒙案例",  // 每日浏览一个鸿蒙案例 (+10)
-		"Star一个鸿蒙案例", // 每日Star一个鸿蒙案例代码仓 (+30)
+		huawei.TagDailyLogin,
+		huawei.TagDevSpace,
+		huawei.TagHMDailyCaseView,
+		huawei.TagHMStarCaseRepo,
 	},
 	"weekly": {
-		"实践一个实验",        // 每周实践一个实验 (+50)
-		"Agent开发实践中心代码仓提 Issue", // 每周提 Issue (+60)
-		"Agent开发实践中心代码仓",       // 每周 Star (+50)
-		"参加开发者活动",         // 每周参加开发者活动 (+10)
+		huawei.TagStarPracticeRepo,
+		huawei.TagIssuePracticeRepo,
+		huawei.TagHMWeeklyCase,
 	},
 	"gallery-publish": {
-		"在开发者作品展览馆中发布作品", // +200，每月一次
+		huawei.TagPublishGallery,
 	},
 }
 
@@ -1537,8 +1559,8 @@ func (s *Server) accountBatchDone(acctID, name string) (bool, int, int, error) {
 	}
 
 	type queryResult struct {
-		missions []huawei.Mission
-		err      error
+		done map[string]bool
+		err  error
 	}
 	ch := make(chan queryResult, 1)
 
@@ -1551,17 +1573,17 @@ func (s *Server) accountBatchDone(acctID, name string) (bool, int, int, error) {
 			ch <- r
 		}()
 		s.withAccount(acctID, func() any {
-			sess, err := huawei.New("")
-			if err != nil {
-				r.err = err
+			st := loadGrowState()
+			if !st.OK {
+				r.err = fmt.Errorf("%s", st.Err)
 				return nil
 			}
-			ms, err := sess.AllMissions()
-			if err != nil {
-				r.err = err
-				return nil
+			r.done = map[string]bool{}
+			for tag, t := range st.Tasks {
+				if t.Finished() {
+					r.done[tag] = true
+				}
 			}
-			r.missions = ms
 			return nil
 		})
 	}()
@@ -1576,20 +1598,10 @@ func (s *Server) accountBatchDone(acctID, name string) (bool, int, int, error) {
 		return false, 0, len(mustDo), qr.err
 	}
 
-	doneTitles := map[string]bool{}
-	for _, m := range qr.missions {
-		if m.IsFinish == 1 {
-			doneTitles[m.Title] = true
-		}
-	}
-
 	hit := 0
-	for _, want := range mustDo {
-		for title := range doneTitles {
-			if strings.Contains(title, want) {
-				hit++
-				break
-			}
+	for _, tag := range mustDo {
+		if qr.done[tag] {
+			hit++
 		}
 	}
 	return hit >= len(mustDo), hit, len(mustDo), nil
@@ -3767,7 +3779,9 @@ func summarize(content string, n int) string {
 //
 // 这里把 runDaily 包一层导出，CLI 就能复用同一份逻辑，
 // 不用在 shell 里重写一遍（重写必然两边不同步）。
-func RunDailyForCLI() map[string]any {
+func RunDailyForCLI() (result map[string]any) {
+	started := time.Now()
+	defer func() { NotifyCLIResult("daily", config.AccountID(), result, time.Since(started)) }()
 	s, err := NewServer("")
 	if err != nil {
 		return map[string]any{"error": err.Error()}
@@ -3776,7 +3790,9 @@ func RunDailyForCLI() map[string]any {
 }
 
 // RunWeeklyForCLI 同上，供命令行调用一键周常。
-func RunWeeklyForCLI() map[string]any {
+func RunWeeklyForCLI() (result map[string]any) {
+	started := time.Now()
+	defer func() { NotifyCLIResult("weekly", config.AccountID(), result, time.Since(started)) }()
 	s, err := NewServer("")
 	if err != nil {
 		return map[string]any{"error": err.Error()}
@@ -3794,7 +3810,9 @@ func RunWeeklyForCLI() map[string]any {
 // 为什么 CLI 也要有：定时任务（hwcloud-daily.sh）是 shell 调 CLI 跑的，
 // 面板按钮和定时脚本不能各写一套批量逻辑 —— 那样迟早不同步
 // （历史上 runDaily 加了鸿蒙任务、脚本没跟着改，就漏跑过一整轮）。
-func RunBatchForCLI(name string) map[string]any {
+func RunBatchForCLI(name string) (result map[string]any) {
+	started := time.Now()
+	defer func() { NotifyCLIResult(name, batchAllID, result, time.Since(started)) }()
 	s, err := NewServer("")
 	if err != nil {
 		return map[string]any{"error": err.Error()}
@@ -3995,46 +4013,48 @@ func (s *Server) runDaily() map[string]any {
 
 	// 先读一次成长中心任务状态，已完成的步骤直接跳过。
 	//
-	// 为什么必须这样：这四个步骤都是「产生外部副作用」的动作 ——
-	// 重复跑会重复发文章（公开博客刷屏）、重复点 DevSpace、重复开案例页。
+	// 为什么必须这样：这些步骤都是「产生外部副作用」的动作 ——
+	// 重复点 DevSpace、重复开案例页、重复 Star 都会白跑一遍。
 	// 而 daily 会被手动点、定时器、补跑脚本各触发一次，同一天跑多次很正常。
-	// 成长中心的 is_finish 是权威判定，早上已完成就该跳过。
+	//
+	// 2026-11-23 起状态源切到新版成长中心（grow / grow-dataset）。
+	// 旧 devdata 接口已下线，返回 404 / 403 not login。
+	growState := loadGrowState()
 	doneToday := map[string]bool{}
-	if sess0, err := huawei.New(""); err == nil {
-		if ms, err := huawei.TasksByStar(sess0, 1, 2); err == nil {
-			for _, m := range ms {
-				if m.IsFinish == 1 {
-					doneToday[m.Title] = true
-				}
+	if growState.OK {
+		for tag, t := range growState.Tasks {
+			if t.Finished() {
+				doneToday[tag] = true
 			}
-			svcLog("[daily] 今日已完成 %d 项，跳过对应步骤", len(doneToday))
 		}
+		svcLog("[daily] 新成长中心今日已完成 %d 项", len(doneToday))
+	} else {
+		svcLog("[daily] 新成长中心状态查询失败: %s", growState.Err)
 	}
-	skipIfDone := func(name, match string) bool {
-		for title := range doneToday {
-			if strings.Contains(title, match) {
-				svcLog("[daily] %s 今日已完成，跳过", name)
-				steps = append(steps, map[string]any{"name": name, "ok": true, "msg": "今日已完成，跳过"})
-				return true
-			}
+	skipIfDone := func(name, tag string) bool {
+		if growState.OK && growState.growDone(tag) {
+			svcLog("[daily] %s 今日已完成，跳过", name)
+			steps = append(steps, map[string]any{"name": name, "ok": true, "msg": "今日已完成，跳过"})
+			return true
 		}
 		return false
 	}
 
-	// 1. 签到
-	svcLog("[daily] 步骤1/3 签到…")
-	if sess, err := huawei.New(""); err != nil {
-		svcLog("[daily] 签到失败（建会话）: %v", err)
-		steps = append(steps, map[string]any{"name": "签到", "ok": false, "msg": err.Error()})
-	} else if already, err := sess.AutoSign(); err != nil {
+	// 1. 签到（新版成长中心）
+	svcLog("[daily] 步骤1/5 签到…")
+	if res, err := s.growSign(); err != nil {
 		svcLog("[daily] 签到失败: %v", err)
 		steps = append(steps, map[string]any{"name": "签到", "ok": false, "msg": err.Error()})
-	} else if already {
+	} else if already, _ := res["already"].(bool); already {
 		svcLog("[daily] 签到：今日已签到")
 		steps = append(steps, map[string]any{"name": "签到", "ok": true, "msg": "今日已签到"})
+	} else if signed, _ := res["signed"].(bool); signed {
+		msg, _ := res["msg"].(string)
+		svcLog("[daily] %s", msg)
+		steps = append(steps, map[string]any{"name": "签到", "ok": true, "msg": msg})
 	} else {
-		svcLog("[daily] 签到成功")
-		steps = append(steps, map[string]any{"name": "签到", "ok": true, "msg": "签到成功"})
+		svcLog("[daily] 签到未生效: %v", res)
+		steps = append(steps, map[string]any{"name": "签到", "ok": false, "msg": "签到未生效"})
 	}
 
 	// 2. DevSpace
@@ -4043,7 +4063,7 @@ func (s *Server) runDaily() map[string]any {
 	// 虽然返回 success，但成长中心判定不通过（它认页面行为事件）。
 	// 实测 2026-11-07 浏览器打开实践中心 → 点「前往AI DevSpace实践」
 	// → 进入 AI 开发者空间后，成长中心「每日体验AI DevSpace」变成已完成。
-	if !skipIfDone("DevSpace", "DevSpace") {
+	if !skipIfDone("DevSpace", huawei.TagDevSpace) {
 		svcLog("[daily] 步骤2/5 DevSpace（浏览器）…")
 		if res, err := task.RunDevSpaceBrowser(nil, false); err != nil {
 			svcLog("[daily] DevSpace 失败: %v", err)
@@ -4056,9 +4076,23 @@ func (s *Server) runDaily() map[string]any {
 
 	// 3. 发文章
 	//
-	// 走浏览器编辑器：纯协议 PublishBlogAPI 返回 success 但成长中心不认。
-	// 实测 2026-11-07 用浏览器发布后「每日发布文章」立即变成已完成。
-	if !skipIfDone("发文章", "发布文章") {
+	// 2026-11-23 新任务清单里已经**没有**「每日发布文章」这一项
+	// （新清单是 签到 / DevSpace / 鸿蒙浏览 / 鸿蒙Star + 周常/月度）。
+	// 如果还按旧逻辑每天发一篇，就是往公开博客无意义刷内容，
+	// 而且不会加任何积分 —— 所以这里只在「旧清单仍要求发文章」时才做：
+	// 即新站任务列表里明确存在发文章类任务（tag 含 blog）。
+	needBlog := false
+	if growState.OK {
+		for tag, t := range growState.Tasks {
+			if strings.Contains(strings.ToLower(tag), "blog") || strings.Contains(t.Title, "发布文章") {
+				if !t.Finished() {
+					needBlog = true
+				}
+				break
+			}
+		}
+	}
+	if needBlog {
 		svcLog("[daily] 步骤3/5 发文章（浏览器）…")
 		if raw, err := os.ReadFile(filepath.Join(config.DataDir(), "blog_post.md")); err != nil {
 			svcLog("[daily] 发文章缺少 blog_post.md")
@@ -4077,6 +4111,8 @@ func (s *Server) runDaily() map[string]any {
 			svcLog("[daily] 发文章成功: %v", res["url"])
 			steps = append(steps, map[string]any{"name": "发文章", "ok": true, "msg": "已发布", "detail": res})
 		}
+	} else {
+		svcLog("[daily] 新任务清单无发文章项，跳过")
 	}
 
 	// 4/5. 鸿蒙实践中心的每日任务（浏览器，各约 40 秒 / 1 分钟）
@@ -4093,7 +4129,7 @@ func (s *Server) runDaily() map[string]any {
 	// 注意 dwell 要真的耗 30 秒，所以放在最后，避免拖慢前面的任务。
 	stateDir := filepath.Join(config.Root(), "accounts", config.AccountID(), "state")
 
-	if !skipIfDone("鸿蒙浏览案例", "浏览") {
+	if !skipIfDone("鸿蒙浏览案例", huawei.TagHMDailyCaseView) {
 		svcLog("[daily] 步骤4/5 鸿蒙每日浏览案例（浏览器）…")
 		if sess, err := huawei.NewForAccount(stateDir); err != nil {
 			svcLog("[daily] 鸿蒙浏览失败（建会话）: %v", err)
@@ -4111,9 +4147,8 @@ func (s *Server) runDaily() map[string]any {
 		}
 	}
 
-	// 注意 match 必须足够具体：周常任务里也有「每周Star一个Agent开发实践中心
-	// 代码仓」，用泛化的 "Star" 会误匹配，导致每日 Star 被跳过。
-	if !skipIfDone("鸿蒙Star", "Star一个鸿蒙案例") {
+	// 用精确 tag 判断，避免与周常「每周Star一个Agent开发实践中心代码仓」混淆。
+	if !skipIfDone("鸿蒙Star", huawei.TagHMStarCaseRepo) {
 		svcLog("[daily] 步骤5/5 鸿蒙 Star 案例仓（浏览器）…")
 		if sess, err := huawei.NewForAccount(stateDir); err != nil {
 			steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": err.Error()})
@@ -4181,30 +4216,25 @@ func (s *Server) runWeekly() map[string]any {
 	// 会话检查已由 startJob 在进入 withAccount 之前完成。
 	svcLog("[weekly] 开始（账号 %s）", config.AccountID())
 
-	// 1. 云实验
+	// 1. 云实验（旧任务「每周实践一个实验」）
 	//
 	// 先查任务是否已完成 —— 华为云实验每次开始都会消耗「今日免费名额」，
 	// 重复跑纯属浪费（实测连续跑会把剩余名额从 114 掉到 113）。
 	// 而且上次实验没正常结束时，再点「开始实验」会因为剩余时长状态卡住，
 	// 页面拿完 quota 数据就停住不跳转，白等 180 秒还占一次名额。
-	svcLog("[weekly] 步骤1/5 云实验：查询完成状态…")
-	if sess, err := huawei.New(""); err == nil {
-		if ms, err := huawei.TasksByStar(sess, 1); err == nil {
-			for _, m := range ms {
-				if strings.Contains(m.Title, "实验") && m.IsFinish == 1 {
-					svcLog("[weekly] 云实验本周已完成，跳过（省一次免费名额）")
-					steps = append(steps, map[string]any{
-						"name": "云实验", "ok": true, "msg": "本周已完成，跳过（省一次免费名额）",
-					})
-					goto issueStep
-				}
-			}
-			svcLog("[weekly] 云实验未完成，开始执行（可能要几分钟）")
-		} else {
-			svcLog("[weekly] 查询任务列表失败: %v（仍继续尝试执行）", err)
+	//
+	// 2026-11-23 新清单里已经没有「每周实践一个实验」，
+	// 该任务不在新站的 tag 列表里。保留执行逻辑以便旧平台恢复/兼容，
+	// 但状态查询改走新站：查不到该任务时按「不需要执行」处理。
+	svcLog("[weekly] 步骤1/6 云实验：查询完成状态…")
+	if st := loadGrowState(); st.OK {
+		if _, exists := st.Tasks["weekly_lab_practice"]; !exists {
+			svcLog("[weekly] 新清单无「实践一个实验」，跳过")
+			steps = append(steps, map[string]any{"name": "云实验", "ok": true, "msg": "新任务清单中已无此项，跳过"})
+			goto issueStep
 		}
 	} else {
-		svcLog("[weekly] 建立会话失败: %v（仍继续尝试执行）", err)
+		svcLog("[weekly] 新成长中心状态不可用: %s", st.Err)
 	}
 	if raw, err := os.ReadFile(filepath.Join(config.DataDir(), "lab_record.txt")); err != nil {
 		svcLog("[weekly] 云实验缺少 lab_record.txt")
@@ -4253,8 +4283,8 @@ issueStep:
 	// 页面加载时会自己换新 access_token，主动重登反而会触发网易易盾
 	// 「拖白球避障」验证码（很难自动过），拖慢甚至搞挂整个周常。
 	// 只有真正提交失败时才重登一次。
-	svcLog("[weekly] 步骤2/5 提Issue：查询完成状态…")
-	if s.weeklyMissionDone("Issue") {
+	svcLog("[weekly] 步骤2/6 提Issue：查询完成状态…")
+	if st := loadGrowState(); st.OK && st.growDone(huawei.TagIssuePracticeRepo) {
 		svcLog("[weekly] 提Issue 本周已完成，跳过")
 		steps = append(steps, map[string]any{"name": "提Issue", "ok": true, "msg": "本周已完成，跳过"})
 	} else if raw, err := os.ReadFile(filepath.Join(config.DataDir(), "issue_feature.md")); err != nil {
@@ -4294,8 +4324,8 @@ issueStep:
 	// 每次挑组织下第一个**还没 star 过**的仓库 —— 这样每周跑都会选到
 	// 一个新的，不会重复 star 同一个。判据只能靠打开仓库页读按钮文字
 	// （Star / Starred），接口侧拿不到已 star 状态，原因见 task.StarRepo 注释。
-	svcLog("[weekly] 步骤3/5 Star仓库：查询完成状态…")
-	if s.weeklyMissionDone("Star") {
+	svcLog("[weekly] 步骤3/6 Star仓库：查询完成状态…")
+	if st := loadGrowState(); st.OK && st.growDone(huawei.TagStarPracticeRepo) {
 		svcLog("[weekly] Star仓库本周已完成，跳过")
 		steps = append(steps, map[string]any{"name": "Star仓库", "ok": true, "msg": "本周已完成，跳过"})
 	} else if res, err := task.StarRepo(false); err != nil {
@@ -4309,11 +4339,36 @@ issueStep:
 		steps = append(steps, map[string]any{"name": "Star仓库", "ok": false, "msg": fmt.Sprint(res["result"])})
 	}
 
+	// 4. Star 开源项目 Grape（一次性任务 +50）
+	//
+	// 2026-11-23 新增。Grape 是 GitHub 上的开源仓库，
+	// 任务判定看 GitHub Star 行为（与华为云账号绑定）。
+	// 已完成就跳过；没完成走 task.StarGrapeRepo。
+	svcLog("[weekly] 步骤4/6 Star Grape 开源仓（一次性）…")
+	if st := loadGrowState(); st.OK && st.growDone(huawei.TagGrapeOpenSource) {
+		svcLog("[weekly] Grape 已 Star，跳过")
+		steps = append(steps, map[string]any{"name": "Star Grape", "ok": true, "msg": "已完成，跳过"})
+	} else if res, err := task.StarGrapeRepo(false); err != nil {
+		svcLog("[weekly] Star Grape 失败: %v", err)
+		steps = append(steps, map[string]any{"name": "Star Grape", "ok": false, "msg": err.Error()})
+	} else if ok, _ := res["ok"].(bool); ok {
+		svcLog("[weekly] Star Grape 成功: %v", res["repo"])
+		steps = append(steps, map[string]any{"name": "Star Grape", "ok": true, "msg": "已 Star " + fmt.Sprint(res["repo"]), "detail": res})
+	} else {
+		msg, _ := res["msg"].(string)
+		svcLog("[weekly] Star Grape 未完成: %s", msg)
+		steps = append(steps, map[string]any{"name": "Star Grape", "ok": false, "msg": msg, "detail": res})
+	}
+
 	// 5. 开发者活动：报名一个进行中的活动
-	svcLog("[weekly] 步骤4/5 开发者活动：查询完成状态…")
-	if s.weeklyMissionDone("活动") {
-		svcLog("[weekly] 开发者活动本周已完成，跳过")
-		steps = append(steps, map[string]any{"name": "开发者活动", "ok": true, "msg": "本周已完成，跳过"})
+	//
+	// 2026-11-23 新清单里没有「参加开发者活动」「开发者赛事」，
+	// 这两项改为「仅当新站任务列表确实存在时才执行」。
+	// 不再用失效的旧接口查状态（weeklyMissionDone 永远返回 false）。
+	svcLog("[weekly] 步骤5/7 开发者活动…")
+	if st := loadGrowState(); st.OK && !hasGrowTaskLike(st, nil, "event", "活动") {
+		svcLog("[weekly] 新清单无开发者活动，跳过")
+		steps = append(steps, map[string]any{"name": "开发者活动", "ok": true, "msg": "新任务清单中已无此项，跳过"})
 	} else if res, err := task.JoinEvent(false); err != nil {
 		svcLog("[weekly] 开发者活动失败: %v", err)
 		steps = append(steps, map[string]any{"name": "开发者活动", "ok": false, "msg": err.Error()})
@@ -4342,10 +4397,10 @@ issueStep:
 	//   - 报名表职业必须选「其他」，选「企业员工」会让 readonly 的
 	//     「公司」字段变必填，而该字段值来自账号资料，空值填不进去
 	//   - 作品必须是 zip，每天最多上传 1 次
-	svcLog("[weekly] 步骤5/5 开发者赛事：查询完成状态…")
-	if s.weeklyMissionDone("赛事") {
-		svcLog("[weekly] 开发者赛事本周已完成，跳过")
-		steps = append(steps, map[string]any{"name": "开发者赛事", "ok": true, "msg": "本周已完成，跳过"})
+	svcLog("[weekly] 步骤6/7 开发者赛事…")
+	if st := loadGrowState(); st.OK && !hasGrowTaskLike(st, []string{huawei.TagICTInnovation}, "contest", "赛事", "大赛") {
+		svcLog("[weekly] 新清单无开发者赛事，跳过")
+		steps = append(steps, map[string]any{"name": "开发者赛事", "ok": true, "msg": "新任务清单中已无此项，跳过"})
 	} else {
 		svcLog("[weekly] 开发者赛事未完成，开始报名 + 提交作品（可能要几分钟）")
 		zipPath := filepath.Join(config.DataDir(), "work_upload.zip")
@@ -4362,38 +4417,44 @@ issueStep:
 		}
 	}
 
-	// 7. 鸿蒙实践中心：云端实践（每周 +100）
+	// 6. 鸿蒙实践中心：每周实践一次鸿蒙案例（新清单 WEEKLY +100）
 	//
-	// 这条走不了纯协议 —— external_report 类型，submit 直接 403
-	// browser_submit_not_allowed，上报由 DevSpace 环境内部完成。
-	// 现在改成开浏览器走完整流程：授权临时凭据 → 等环境就绪 → 平台自己上报。
-	// 详见 internal/task/cloud_practice.go。
-	stateDirW := filepath.Join(config.Root(), "accounts", config.AccountID(), "state")
-	svcLog("[weekly] 步骤6/6 鸿蒙云端实践…")
-	needPractice := true
-	if sessW, err := huawei.NewForAccount(stateDirW); err == nil {
-		if list, err := task.HarmonyTasks(sessW); err == nil {
-			for _, t := range list {
-				if t.TaskKey == "cloud-practice" && t.Done {
-					needPractice = false
-				}
-			}
-		}
-	}
-
-	if !needPractice {
-		svcLog("[weekly] 鸿蒙云端实践本周已完成，跳过")
-		steps = append(steps, map[string]any{"name": "鸿蒙云端实践", "ok": true, "msg": "本周已完成"})
+	// 2026-11-23 新增/改名：要求「打开案例详情页 → 云端实践 → 作业中心
+	// 完成项目创建和 git 仓代码拉取，最终成功编译打包」，且每周需不同案例。
+	// 这条比旧的「云端实践」更重，必须先查新站状态再跑。
+	svcLog("[weekly] 步骤6/7 鸿蒙每周实践案例…")
+	if st := loadGrowState(); st.OK && st.growDone(huawei.TagHMWeeklyCase) {
+		svcLog("[weekly] 鸿蒙每周实践本周已完成，跳过")
+		steps = append(steps, map[string]any{"name": "鸿蒙每周实践", "ok": true, "msg": "本周已完成，跳过"})
 	} else if res, err := task.RunCloudPractice(false); err != nil {
-		svcLog("[weekly] 鸿蒙云端实践失败: %v", err)
-		steps = append(steps, map[string]any{"name": "鸿蒙云端实践", "ok": false, "msg": err.Error()})
+		svcLog("[weekly] 鸿蒙每周实践失败: %v", err)
+		steps = append(steps, map[string]any{"name": "鸿蒙每周实践", "ok": false, "msg": err.Error()})
 	} else if ok, _ := res["ok"].(bool); ok {
-		svcLog("[weekly] 鸿蒙云端实践完成：环境已就绪")
-		steps = append(steps, map[string]any{"name": "鸿蒙云端实践", "ok": true, "msg": "环境已就绪", "detail": res})
+		svcLog("[weekly] 鸿蒙每周实践已启动：环境已就绪")
+		steps = append(steps, map[string]any{"name": "鸿蒙每周实践", "ok": true, "msg": "环境已就绪", "detail": res})
 	} else {
 		msg, _ := res["msg"].(string)
-		svcLog("[weekly] 鸿蒙云端实践未完成: %s", msg)
-		steps = append(steps, map[string]any{"name": "鸿蒙云端实践", "ok": false, "msg": msg, "detail": res})
+		svcLog("[weekly] 鸿蒙每周实践未完成: %s", msg)
+		steps = append(steps, map[string]any{"name": "鸿蒙每周实践", "ok": false, "msg": msg, "detail": res})
+	}
+
+	// 7. 报名华为ICT大赛创新赛（新清单一次性 +350）
+	//
+	// 需要 ICT 平台报名 + 绑定华为云 + 实名 + 开通码道，多步人工表单。
+	// 这里只做只读探测，把当前状态如实写进步骤；不提交任何表单。
+	svcLog("[weekly] 步骤7/7 ICT 大赛创新赛…")
+	if st := loadGrowState(); st.OK && st.growDone(huawei.TagICTInnovation) {
+		svcLog("[weekly] ICT 创新赛已报名，跳过")
+		steps = append(steps, map[string]any{"name": "ICT创新赛", "ok": true, "msg": "已完成，跳过"})
+	} else if res, err := task.ICTInnovationStatus(false); err != nil {
+		svcLog("[weekly] ICT 创新赛探测失败: %v", err)
+		steps = append(steps, map[string]any{"name": "ICT创新赛", "ok": false, "msg": err.Error()})
+	} else if ok, _ := res["ok"].(bool); ok {
+		steps = append(steps, map[string]any{"name": "ICT创新赛", "ok": true, "msg": "已处理", "detail": res})
+	} else {
+		msg, _ := res["msg"].(string)
+		svcLog("[weekly] ICT 创新赛未完成: %s", msg)
+		steps = append(steps, map[string]any{"name": "ICT创新赛", "ok": false, "msg": msg, "detail": res})
 	}
 
 	svcLog("[weekly] 结束，总耗时 %s", time.Since(wStart).Round(time.Second))
@@ -4402,25 +4463,16 @@ issueStep:
 
 // weeklyMissionDone 判断标题含 kw 的任务是否已完成。
 //
-// 用于周常前置检查：已经达标的步骤直接跳过，避免重复消耗配额
-// （云实验每次开始都会掉一个免费名额）或往仓库刷重复 Issue。
-//
-// 坑：任务分散在不同星级里 —— 「每周实践一个实验」是 1 星，
-// 「每周给…代码仓提 Issue」是 2 星。只查 1 星会漏掉提 Issue，
-// 导致周常每次都多发一条重复 Issue。这里查全部星级。
-//
-// 查询失败时返回 false —— 宁可多跑一次，也不要因为接口抖动误判成已完成。
+// 2026-11-23：旧 devdata 任务接口已下线，本函数不再被业务调用。
+// 保留它只是为了防止外部/历史代码引用时编译失败；新代码一律用
+// loadGrowState + task_tag 精确判定（见 grow_tasks.go）。
 func (s *Server) weeklyMissionDone(kw string) bool {
-	sess, err := huawei.New("")
-	if err != nil {
+	st := loadGrowState()
+	if !st.OK {
 		return false
 	}
-	ms, err := huawei.TasksByStar(sess, 1, 2, 3, 4, 5)
-	if err != nil {
-		return false
-	}
-	for _, m := range ms {
-		if strings.Contains(m.Title, kw) && m.IsFinish == 1 {
+	for _, t := range st.Tasks {
+		if strings.Contains(t.Title, kw) && t.Finished() {
 			return true
 		}
 	}

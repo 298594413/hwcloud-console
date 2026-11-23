@@ -474,6 +474,28 @@ var cookieHosts = []string{
 
 // SessionInfo 返回当前会话的剩余信息。
 func SessionInfo() (map[string]any, error) {
+	// 2026-11-23：新版成长中心已是主站，先按新站探活。
+	// 旧 devdata 接口已下线（403 not login / 404），huawei.New 的
+	// CheckLogin 只会把在线账号误判成离线，进而触发不必要的账密重登。
+	if gs, gerr := huawei.NewGrowSession(); gerr == nil {
+		if u, uerr := gs.UserInfo(); uerr == nil {
+			out := map[string]any{
+				"alive":    true,
+				"username": u.DomainName,
+				"points":   u.TotalPoints,
+				"signed":   u.Signed,
+				"backend":  "grow-new",
+			}
+			if t, name, ok := authExpiry(); ok {
+				out["auth_expiry"] = t.Format("2006-01-02 15:04:05")
+				out["auth_cookie"] = name
+				out["auth_remaining_hours"] = time.Until(t).Hours()
+				out["auth_remaining_days"] = time.Until(t).Hours() / 24
+			}
+			return out, nil
+		}
+	}
+	// 新站不可用时退回旧逻辑，保持兼容。
 	sess, err := huaweiSession()
 	if err != nil {
 		return nil, err
