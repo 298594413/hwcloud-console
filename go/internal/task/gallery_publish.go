@@ -721,26 +721,32 @@ func navigateFromGrowthCenter(ctx playwright.BrowserContext, page playwright.Pag
 	clicked := false
 	for round := 0; round < 3 && !clicked; round++ {
 		res, _ := page.Evaluate(`() => {
-			// 在所有元素里找「包含任务标题 + 去完成 按钮」的最小卡片
 			let best = null, bestArea = 1e18;
 			for (const e of document.querySelectorAll('*')) {
 				const t = e.innerText || '';
 				if (t.indexOf('在开发者作品展览馆中发布作品') < 0) continue;
 				const r = e.getBoundingClientRect();
-				if (r.width < 150 || r.width > 1200 || r.height < 40) continue;
+				if (r.width < 150 || r.width > 1400 || r.height < 40) continue;
 				const area = r.width * r.height;
 				if (area < bestArea) { bestArea = area; best = e; }
 			}
-			if (!best) return {ok:false, reason:'card-not-found'};
-			for (const b of best.querySelectorAll('button,a,div,span')) {
-				if ((b.innerText||'').trim() !== '去完成') continue;
-				const r = b.getBoundingClientRect();
-				if (r.width < 20 || r.height < 12) continue;
-				b.scrollIntoView({block:'center'});
-				b.click();
-				return {ok:true, x:Math.round(r.x), y:Math.round(r.y)};
+			if (!best) return {ok:false, reason:'card-not-found', bodyLen:(document.body.innerText||'').length};
+			const want = ['去完成','立即前往','前往','去参与','立即参与','参与','开始','立即'];
+			const candidates = [best, best.parentElement, best.parentElement && best.parentElement.parentElement].filter(Boolean);
+			const seen = [];
+			for (const root of candidates) {
+				for (const b of root.querySelectorAll('button,a,div,span')) {
+					const txt = (b.innerText||'').trim();
+					if (!txt || txt.length > 12) continue;
+					const r = b.getBoundingClientRect();
+					if (r.width < 20 || r.height < 12) continue;
+					if (!want.some(w => txt.indexOf(w) >= 0)) { seen.push(txt); continue; }
+					b.scrollIntoView({block:'center'});
+					b.click();
+					return {ok:true, x:Math.round(r.x), y:Math.round(r.y), clicked:txt};
+				}
 			}
-			return {ok:false, reason:'button-not-found'};
+			return {ok:false, reason:'button-not-found', cardText:(best.innerText||'').slice(0,200), buttons:seen.slice(0,20)};
 		}`)
 		if m, ok := res.(map[string]any); ok {
 			if asBool(m["ok"]) {
@@ -748,7 +754,7 @@ func navigateFromGrowthCenter(ctx playwright.BrowserContext, page playwright.Pag
 				logStep("  已点任务「去完成」")
 				break
 			}
-			logStep("  未找到入口: %v", m["reason"])
+			logStep("  未找到入口: %v (card=%v buttons=%v)", m["reason"], m["cardText"], m["buttons"])
 		}
 		page.WaitForTimeout(4000)
 	}
