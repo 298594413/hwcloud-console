@@ -1010,7 +1010,10 @@ func sendToAIShell(page playwright.Page, shell playwright.Frame, msg string) err
 		}
 	}
 	page.WaitForTimeout(1500)
-	if val, _ := editor.InnerText(); strings.TrimSpace(val) == "" {
+	// contenteditable 多行文本 Fill 后 InnerText 可能为空（内容在子元素里），
+	// 用 TextContent 兜底；两者都空才是真的没填进去。
+	valText, _ := editor.TextContent()
+	if valInner, _ := editor.InnerText(); strings.TrimSpace(valInner) == "" && strings.TrimSpace(valText) == "" {
 		return fmt.Errorf("输入框内容为空")
 	}
 
