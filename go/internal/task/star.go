@@ -63,14 +63,28 @@ func StarRepo(dryRun bool) (map[string]any, error) {
 	}
 	page.WaitForTimeout(6000)
 
-	// 组织仓库列表。用 Evaluate 直接 fetch，省得解析页面。
-	raw, err := page.Evaluate(`async (org) => {
-		const r = await fetch('/api/v5/orgs/' + org + '/repos?page=1&per_page=100',
-		                      {credentials: 'include'});
-		if (!r.ok) return null;
-		const j = await r.json();
-		if (!Array.isArray(j)) return null;
-		return j.map(x => ({id: x.id, url: x.html_url || '', name: x.name || ''}));
+	// 组织仓库列表：从组织主页 DOM 解析，不依赖 /api/v5（会话 JWT 无法当 PAT，
+	// API 会 401；但已登录的浏览器页面能正常渲染仓库列表，直接读链接即可）。
+	if _, err := page.Goto("https://gitcode.com/"+config.GitCodeOrg, playwright.PageGotoOptions{
+		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
+		Timeout:   playwright.Float(60000),
+	}); err != nil {
+		return nil, err
+	}
+	page.WaitForTimeout(6000)
+	raw, err := page.Evaluate(`(org) => {
+		const seen = new Set(), out = [];
+		for (const a of document.querySelectorAll('a[href]')) {
+			const h = a.getAttribute('href') || '';
+			const re = new RegExp('^/' + org + '/([^/]+)/?$');
+			const m = h.match(re);
+			if (!m) continue;
+			const name = m[1];
+			if (!name || seen.has(name)) continue;
+			seen.add(name);
+			out.push({id: 0, url: 'https://gitcode.com' + h, name: name});
+		}
+		return out;
 	}`, config.GitCodeOrg)
 	if err != nil {
 		return nil, err
