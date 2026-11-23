@@ -222,10 +222,15 @@ func CreateIssue(title, body, template string, headless, dryRun bool) (map[strin
 		}
 		buttons := page.Locator(`button:has-text("使用该模板")`)
 		n := count(buttons)
-		if n == 0 {
-			// 语言/改版兜底
-			buttons = page.Locator(`button:has-text("Use this template")`)
+		// 前端路由跳到 choose 后按钮还要 JS 渲染，立即 count 常为 0。
+		// 轮询等按钮出现（中文或英文），最多 15 秒。
+		for i := 0; i < 15 && n == 0; i++ {
+			page.WaitForTimeout(1000)
 			n = count(buttons)
+			if n == 0 {
+				buttons = page.Locator(`button:has-text("Use this template")`)
+				n = count(buttons)
+			}
 		}
 		if n == 0 {
 			return nil, fmt.Errorf("模板选择页没有「使用该模板」按钮（页面可能改版）")
