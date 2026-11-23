@@ -12,34 +12,25 @@ import (
 
 // 鸿蒙实践中心的「云端实践」(+100，每周)。
 //
-// 为什么纯协议走不通：
-//   evaluator 是 external_report，`submit` 接口直接 403
-//   `browser_submit_not_allowed` —— 上报由 DevSpace 环境内部完成，
-//   不对外暴露提交口。
+// 完整链路（2026-11-23 实测验证，AI 编译打包成功、积分到账）：
+//  1. 用华为云登录态打开 harmonybp 案例详情页
+//  2. 点「云端实践」主按钮 → 新窗口 version-select?repo_url=<案例公仓>
+//  3. 选「体验版」（免费、不消耗核时）→ 立即进入
+//  4. 项目管理面板：点「新建项目」→ 表单自动填好（名称/目录/案例公仓地址）→ 点「创建」
+//  5. 创建后点「进入开发环境」→ 切到 CodeArts Web tab
+//  6. 在 chat-textarea 发口令：拉取案例公仓代码 + 编译打包
+//  7. AI 编译（可能报 SDK 版本错要改文件）→ 循环点 button.perm-btn.always 授权
+//  8. 检测「编译成功」→ 关机收尾
 //
-// 完整链路（全部在浏览器里完成）：
-//  1. 打开 devstation 的 harmony-practice-center 页，让它走
-//     index/islogin?ticket=ST-... 完成 DevSpace 侧登录
-//  2. 点「临时凭据自动配置」弹窗的「同意」—— 不点会一直卡在这个弹窗，
-//     永远进不了环境
-//  3. 环境创建/启动（容器 devenv），等「环境准备中」消失
-//  4. 环境就绪后 floor-practice-center 会加载，上报由平台侧自己发
-//
-// 关于内测资格：
-//   案例详情页的「云端实践」按钮会先查 beta-harmony-practice-application，
-//   但那个接口在 devstation-svc.connect 域，用 Go 发要过 WAF + CSRF，
-//   实测拿不到登录态（403 not login）。好在这不影响主流程 ——
-//   直接打开 DevSpace 页面本身就会走完整登录并创建环境。
-//   申请状态只是给人看的信息，不是执行前提。
-//
-// 注意：这个函数会真的创建/启动一个 DevSpace 容器环境，消耗核时。
-// 调用前应先确认任务未完成。
+// 用体验版环境：免费、秒级启动、不消耗核时，关闭后数据释放。
 
 const (
-	devSpacePageURL = "https://devstation.developer.huaweicloud.com/ai-devspace/beta/harmony-practice-center"
+	harmonyCaseURL = "https://harmonybp.developer.huaweicloud.com/cases/c0043e1e9d0240d19c23fa2556d5ecfc" // 数独案例（纯端侧、最快）
+	buildPrompt    = "拉取 https://gitcode.com/harmony-practice-center/Harmony-APP-sudoku.git 代码到当前项目目录，" +
+		"然后执行编译打包（用 hvigorw assembleHap 或项目对应的编译命令），确保编译成功。直接执行不要询问我。"
 )
 
-// RunCloudPractice 完成「云端实践」：打开 DevSpace → 授权 → 等环境就绪。
+// RunCloudPractice 完成「云端实践」：案例详情 → 云端实践 → 体验版 → 新建项目 → CodeArts Web 发编译口令 → 授权 → 编译成功。
 func RunCloudPractice(headless bool) (map[string]any, error) {
 	pw, err := playwright.Run()
 	if err != nil {
@@ -58,137 +49,237 @@ func RunCloudPractice(headless bool) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = page.Close() }()
 
-	if _, err := page.Goto(devSpacePageURL, playwright.PageGotoOptions{
+	out := map[string]any{"case_url": harmonyCaseURL, "ok": false}
+
+	// 1) 打开案例详情页
+	if _, err := page.Goto(harmonyCaseURL, playwright.PageGotoOptions{
 		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
 		Timeout:   playwright.Float(90000),
 	}); err != nil {
-		return nil, fmt.Errorf("打开 DevSpace 失败: %v", err)
+		return nil, fmt.Errorf("打开案例详情失败: %v", err)
 	}
-	page.WaitForTimeout(16000)
+	page.WaitForTimeout(8000)
+	logStep("[cloud-practice] 已打开案例详情页")
 
-	// 点「同意」授权临时凭据。
-	//
-	// 这个弹窗是进入环境的必经步骤：不点，页面就一直停在
-	// 「是否同意将您的临时访问凭据(AK/SK) 同步至 AI 开发者空间环境」，
-	// 环境根本不会开始创建。
-	agreed := false
-	// 2026-11-23 实测：新版页面会弹「CodeArts代码智能体服务声明」，
-	// 按钮是「立即开通」，不点就一直卡在「环境准备中」。加入匹配。
-	for _, label := range []string{"同意", "同意并继续", "立即开通"} {
-		for _, sel := range []string{
-			`button:has-text("%s")`,
-			`.el-button:has-text("%s")`,
-			`[class*="dialog"] button:has-text("%s")`,
-			`[class*="modal"] button:has-text("%s")`,
-		} {
-			loc := page.Locator(fmt.Sprintf(sel, label))
-			n, _ := loc.Count()
-			if n == 0 {
-				continue
+	// 2) 点「云端实践」主按钮 → ExpectPopup 拿新窗口
+	popup, err := page.ExpectPopup(func() error {
+		btn := page.Locator(`button.cp-btn--primary:has-text("云端实践")`).First()
+		n, _ := btn.Count()
+		if n == 0 {
+			return fmt.Errorf("未找到「云端实践」主按钮")
+		}
+		return btn.Click(playwright.LocatorClickOptions{Timeout: playwright.Float(10000)})
+	}, playwright.PageExpectPopupOptions{Timeout: playwright.Float(30000)})
+	if err != nil {
+		return nil, fmt.Errorf("点云端实践失败: %v", err)
+	}
+	defer func() { _ = popup.Close() }()
+	out["version_select_url"] = popup.URL()
+	logStep("[cloud-practice] 已打开版本选择页")
+
+	// 3) 选「体验版」→ 立即进入
+	popup.WaitForTimeout(4000)
+	if !clickTextExact(popup, "体验版") {
+		// 兜底：任意含"体验版"的元素
+		l := popup.Locator(`text=体验版`).First()
+		if n, _ := l.Count(); n > 0 {
+			_ = l.Click(playwright.LocatorClickOptions{Timeout: playwright.Float(6000)})
+		}
+	}
+	popup.WaitForTimeout(1000)
+	enter := popup.Locator(`button:has-text("立即进入")`).Last()
+	if n, _ := enter.Count(); n > 0 {
+		_ = enter.Click(playwright.LocatorClickOptions{Timeout: playwright.Float(10000)})
+	}
+	logStep("[cloud-practice] 已选体验版进入")
+	popup.WaitForTimeout(25000) // 等环境 + CodeArts frame 加载
+
+	// 4) 项目管理：新建项目 → 创建
+	if err := createHarmonyProject(popup); err != nil {
+		out["create_project_err"] = err.Error()
+		// 若项目已存在（之前的残留），继续往下走
+		logStep("[cloud-practice] 新建项目: %v（可能是已存在）", err)
+	} else {
+		out["project_created"] = true
+		logStep("[cloud-practice] 项目已创建")
+	}
+
+	// 5) 进入开发环境
+	entered := clickAnyText(popup, []string{"进入开发环境"})
+	if entered {
+		logStep("[cloud-practice] 已进入开发环境")
+	}
+	popup.WaitForTimeout(15000)
+
+	// 6) 找到 CodeArts Web 的 chat-textarea 并发编译口令
+	chatFrame := findFrameWith(popup, `textarea.chat-textarea`)
+	if chatFrame == nil {
+		// 尝试切到 CodeArts Web tab
+		if clickAnyTextAcrossFrames(popup, []string{"CodeArts Web"}) {
+			popup.WaitForTimeout(8000)
+			chatFrame = findFrameWith(popup, `textarea.chat-textarea`)
+		}
+	}
+	if chatFrame == nil {
+		return nil, fmt.Errorf("找不到 CodeArts Web 输入框")
+	}
+	ta := chatFrame.Locator(`textarea.chat-textarea`).First()
+	_ = ta.Click()
+	_ = ta.PressSequentially(buildPrompt, playwright.LocatorPressSequentiallyOptions{Delay: playwright.Float(5)})
+	popup.WaitForTimeout(1000)
+	if val, _ := ta.InputValue(); strings.TrimSpace(val) == "" {
+		return nil, fmt.Errorf("编译口令未填入输入框")
+	}
+	_ = ta.Press("Enter")
+	logStep("[cloud-practice] 已发送编译口令")
+	out["prompt_sent"] = true
+
+	// 7) 循环点授权 + 等编译成功（最多 12 分钟）
+	compiled := false
+	deadline := time.Now().Add(12 * time.Minute)
+	lastLog := time.Now()
+	for time.Now().Before(deadline) {
+		popup.WaitForTimeout(8000)
+		approveCount := 0
+		// 点所有「始终允许」授权
+		for _, f := range popup.Frames() {
+			btn := f.Locator(`button.perm-btn.always`)
+			n, _ := btn.Count()
+			for i := 0; i < n; i++ {
+				if err := btn.First().Click(playwright.LocatorClickOptions{Timeout: playwright.Float(3000)}); err == nil {
+					approveCount++
+				}
 			}
-			if vis, _ := loc.First().IsVisible(); !vis {
-				continue
-			}
-			if err := loc.First().Click(playwright.LocatorClickOptions{
-				Timeout: playwright.Float(6000),
-			}); err == nil {
-				agreed = true
+		}
+		// 检测编译成功
+		for _, f := range popup.Frames() {
+			txt, _ := f.Locator("body").InnerText()
+			if strings.Contains(txt, "编译成功") || strings.Contains(txt, "BUILD SUCCESSFUL") ||
+				(strings.Contains(txt, "HAP") && strings.Contains(txt, "产物")) {
+				compiled = true
 				break
 			}
 		}
-		if agreed {
+		if compiled {
 			break
 		}
-	}
-
-	// 等环境就绪。
-	// 判据：「环境准备中」消失，且出现「剩余核时」或「当前环境运行中」。
-	//
-	// 2026-11-23 实测（周常真实失败原因）：
-	//   环境其实在正常创建，但 DevSpace 弹出了「版本有更新，建议升级」对话框，
-	//   正文是「环境准备中，请勿关闭窗口...」+ 升级弹窗的「确认/取消」。
-	//   这个弹窗不处理会一直盖住页面，等待循环只能看到「环境准备中」，
-	//   最后误报成「环境 12 分钟未就绪」。
-	//   所以每轮先尝试关掉「取消」/「稍后」/「关闭」，再判断状态。
-	ready := false
-	deadline := time.Now().Add(12 * time.Minute)
-	lastText := ""
-	dismissedUpgrade := false
-	for time.Now().Before(deadline) {
-		page.WaitForTimeout(6000)
-		// 处理升级弹窗：点「取消」比点「确认」安全（不在任务里触发版本升级）。
-		if !dismissedUpgrade {
-			for _, label := range []string{"取消", "稍后", "以后再说", "关闭"} {
-				for _, sel := range []string{
-					`[class*="dialog"] button:has-text("%s")`,
-					`[class*="modal"] button:has-text("%s")`,
-					`button:has-text("%s")`,
-				} {
-					loc := page.Locator(fmt.Sprintf(sel, label))
-					if n, _ := loc.Count(); n == 0 {
-						continue
-					}
-					if vis, _ := loc.First().IsVisible(); !vis {
-						continue
-					}
-					if err := loc.First().Click(playwright.LocatorClickOptions{Timeout: playwright.Float(4000)}); err == nil {
-						dismissedUpgrade = true
-						time.Sleep(2 * time.Second)
-						break
-					}
-				}
-				if dismissedUpgrade {
-					break
-				}
-			}
-		}
-		b, err := page.Locator("body").InnerText()
-		if err != nil {
-			continue
-		}
-		lastText = b
-		if strings.Contains(b, "环境准备中") {
-			continue
-		}
-		if strings.Contains(b, "剩余核时") || strings.Contains(b, "当前环境运行中") {
-			ready = true
-			break
+		if time.Since(lastLog) > 60*time.Second {
+			logStep("[cloud-practice] 等待编译…（授权 %d 次）", approveCount)
+			lastLog = time.Now()
 		}
 	}
-
-	// 环境就绪后再停一会儿，让 floor-practice-center 加载并触发上报
-	if ready {
-		page.WaitForTimeout(20000)
+	out["compiled"] = compiled
+	if compiled {
+		logStep("[cloud-practice] 编译打包成功")
 	}
 
-	// 上报触发后立即关机，避免环境空转持续消耗核时额度。
-	// 关机按钮没有文字，只有 title="关机"；点后弹「是否确定关机？」需点「确认」。
-	shutdownOK := shutdownDevSpace(page)
+	// 8) 关机收尾（体验版本身免费，但持久化环境要关）
+	shutdownOK := shutdownDevSpace(popup)
+	out["shutdown"] = shutdownOK
 	logStep("[cloud-practice] 关机: %v", shutdownOK)
 
-	msg := "环境未在 12 分钟内就绪（DevSpace 侧较慢，可稍后重试）"
-	if ready {
-		msg = "环境已就绪，云端实践已触发"
-	}
-	out := map[string]any{
-		"ok":               ready,
-		"agreed":           agreed,
-		"env_ready":        ready,
-		"dismissed_upgrade": dismissedUpgrade,
-		"shutdown":         shutdownOK,
-		"msg":              msg,
-	}
-	if !ready && lastText != "" {
-		out["page_hint"] = clipRunes(lastText, 300)
+	out["ok"] = compiled
+	if !compiled {
+		out["msg"] = "未在 12 分钟内检测到编译成功"
+	} else {
+		out["msg"] = "云端实践编译打包成功"
 	}
 	return out, nil
 }
 
+// createHarmonyProject 在项目管理面板新建项目（表单通常由案例链接自动填好）。
+func createHarmonyProject(page playwright.Page) error {
+	// 找到含「新建项目」的 frame
+	var pf playwright.Frame
+	for _, f := range page.Frames() {
+		txt, _ := f.Locator("body").InnerText()
+		if strings.Contains(txt, "新建项目") && strings.Contains(txt, "技术模板") {
+			pf = f
+			break
+		}
+	}
+	if pf == nil {
+		return fmt.Errorf("找不到项目管理面板")
+	}
+	// 点「新建项目」打开表单
+	btn := pf.Locator(`button:has-text("新建项目")`).First()
+	if n, _ := btn.Count(); n > 0 {
+		_ = btn.Click(playwright.LocatorClickOptions{Timeout: playwright.Float(6000)})
+		page.WaitForTimeout(2000)
+	}
+	// 表单字段通常由案例链接预填；确认关键字段非空，空则填默认值
+	nameIn := pf.Locator(`input[placeholder="请输入项目名称"]`).First()
+	if n, _ := nameIn.Count(); n > 0 {
+		v, _ := nameIn.InputValue()
+		if strings.TrimSpace(v) == "" {
+			_ = nameIn.Fill("HarmonyPractice")
+		}
+	}
+	dirIn := pf.Locator(`input[placeholder*="my-app"]`).First()
+	if n, _ := dirIn.Count(); n > 0 {
+		v, _ := dirIn.InputValue()
+		if strings.TrimSpace(v) == "" {
+			_ = dirIn.Fill("Harmony-APP-practice")
+		}
+	}
+	// 点「创建」
+	create := pf.Locator(`button:has-text("创建")`).Last()
+	if n, _ := create.Count(); n == 0 {
+		return fmt.Errorf("找不到创建按钮")
+	}
+	if err := create.Click(playwright.LocatorClickOptions{Timeout: playwright.Float(10000)}); err != nil {
+		return err
+	}
+	page.WaitForTimeout(15000)
+	return nil
+}
+
+// clickTextExact 在页面所有元素里点首个文字精确匹配 label 的元素。
+func clickTextExact(page playwright.Page, label string) bool {
+	for _, f := range page.Frames() {
+		l := f.Locator(`text="` + label + `"`).First()
+		if n, _ := l.Count(); n > 0 {
+			if err := l.Click(playwright.LocatorClickOptions{Timeout: playwright.Float(5000)}); err == nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// clickAnyText 在页面里点首个包含任一文字的元素。
+func clickAnyText(page playwright.Page, labels []string) bool {
+	for _, f := range page.Frames() {
+		for _, label := range labels {
+			l := f.Locator(`text=` + label).First()
+			if n, _ := l.Count(); n > 0 {
+				if err := l.Click(playwright.LocatorClickOptions{Timeout: playwright.Float(6000)}); err == nil {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// clickAnyTextAcrossFrames 同 clickAnyText，独立命名便于区分调用点。
+func clickAnyTextAcrossFrames(page playwright.Page, labels []string) bool { return clickAnyText(page, labels) }
+
+// findFrameWith 找包含指定 selector 的 frame。
+func findFrameWith(page playwright.Page, selector string) playwright.Frame {
+	for _, f := range page.Frames() {
+		if n, _ := f.Locator(selector).Count(); n > 0 {
+			return f
+		}
+	}
+	return nil
+}
+
 // shutdownDevSpace 关闭 DevSpace 环境，避免空转持续消耗核时额度。
-// 关机按钮没有文字，只有 title="关机"；点后弹「是否确定关机？」需点「确认」。
 func shutdownDevSpace(page playwright.Page) bool {
-	defer func() { _ = recover() }() // 关机失败不影响主流程结果
+	defer func() { _ = recover() }()
 	for _, f := range page.Frames() {
 		btn := f.Locator(`[title="关机"]`)
 		n, _ := btn.Count()
@@ -198,39 +289,24 @@ func shutdownDevSpace(page playwright.Page) bool {
 		if vis, _ := btn.First().IsVisible(); !vis {
 			continue
 		}
-		if err := btn.First().Click(playwright.LocatorClickOptions{Timeout: playwright.Float(6000)}); err != nil {
-			// 可能确认框已弹出挡住按钮，直接走确认逻辑
-			logStep("  点击关机按钮: %v（尝试直接确认）", err)
-		}
+		_ = btn.First().Click(playwright.LocatorClickOptions{Timeout: playwright.Float(6000)})
 		page.WaitForTimeout(1500)
-		// 确认弹窗：是否确定关机？ 取消 / 确认
 		for _, label := range []string{"确认", "确定"} {
 			cf := f.Locator(`.shutdown-confirm-dialog button:has-text("` + label + `")`)
 			if cn, _ := cf.Count(); cn > 0 {
 				if vis, _ := cf.First().IsVisible(); vis {
 					if err := cf.First().Click(playwright.LocatorClickOptions{Timeout: playwright.Float(6000)}); err == nil {
 						page.WaitForTimeout(3000)
-						logStep("  已确认关机")
 						return true
 					}
 				}
-			}
-		}
-		// 兜底：任意确认框里的确认按钮
-		cf := f.Locator(`[class*="confirm"] button:has-text("确认")`)
-		if cn, _ := cf.Count(); cn > 0 {
-			if err := cf.First().Click(playwright.LocatorClickOptions{Timeout: playwright.Float(5000)}); err == nil {
-				page.WaitForTimeout(3000)
-				return true
 			}
 		}
 	}
 	return false
 }
 
-// pickFreeDevSpaceLink 从实践中心页面挑「免费」的前往 DevSpace 入口。
-// 页面上有多个同名链接：第一个带 dc/dc_sign 签名会进收费的 harmony-practice-center
-// （创建容器、持续烧核时）；带 utm_source=officeagent 的是免费体验入口。
+// pickFreeDevSpaceLink 从实践中心页面挑免费 DevSpace 入口（避开带 dc_sign 的收费链接）。
 func pickFreeDevSpaceLink(page playwright.Page) playwright.Locator {
 	all := page.Locator(`a:has-text("前往AI DevSpace实践")`)
 	n, _ := all.Count()
@@ -241,7 +317,7 @@ func pickFreeDevSpaceLink(page playwright.Page) playwright.Locator {
 			return el
 		}
 	}
-	return all.Last() // 兜底：最后一个通常也是 officeagent，避开第一个带签名的
+	return all.Last()
 }
 
 // clipRunes 按 rune 截断，避免中文被截成半个字。
