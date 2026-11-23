@@ -2,12 +2,15 @@ package task
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/playwright-community/playwright-go"
 
 	"hwcloud/internal/browser"
+	"hwcloud/internal/config"
 )
 
 // 鸿蒙实践中心的「云端实践」(+100，每周)。
@@ -25,9 +28,10 @@ import (
 // 用体验版环境：免费、秒级启动、不消耗核时，关闭后数据释放。
 
 const (
-	harmonyCaseURL = "https://harmonybp.developer.huaweicloud.com/cases/c0043e1e9d0240d19c23fa2556d5ecfc" // 数独案例（纯端侧、最快）
-	buildPrompt    = "拉取 https://gitcode.com/harmony-practice-center/Harmony-APP-sudoku.git 代码到当前项目目录，" +
+	harmonyCasesURL = "https://harmonybp.developer.huaweicloud.com/cases"
+	buildPromptTpl  = "拉取 %s 代码到当前项目目录，" +
 		"然后执行编译打包（用 hvigorw assembleHap 或项目对应的编译命令），确保编译成功。直接执行不要询问我。"
+	lastCaseFile = "harmony_last_case.txt"
 )
 
 // RunCloudPractice 完成「云端实践」：案例详情 → 云端实践 → 体验版 → 新建项目 → CodeArts Web 发编译口令 → 授权 → 编译成功。
@@ -51,17 +55,49 @@ func RunCloudPractice(headless bool) (map[string]any, error) {
 	}
 	defer func() { _ = page.Close() }()
 
-	out := map[string]any{"case_url": harmonyCaseURL, "ok": false}
+	out := map[string]any{"ok": false}
 
-	// 1) 打开案例详情页
-	if _, err := page.Goto(harmonyCaseURL, playwright.PageGotoOptions{
+	// 1) 打开案例列表页，挑一个与上次不同的案例（平台规则：同一案例30天内重复不给分）
+	if _, err := page.Goto(harmonyCasesURL, playwright.PageGotoOptions{
+		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
+		Timeout:   playwright.Float(90000),
+	}); err != nil {
+		return nil, fmt.Errorf("打开案例列表失败: %v", err)
+	}
+	page.WaitForTimeout(8000)
+	chosen, err := pickNextCase(page)
+	if err != nil {
+		return nil, fmt.Errorf("挑选案例失败: %v", err)
+	}
+	caseURL := harmonyCasesURL + "/" + chosen.ID
+	out["case_id"] = chosen.ID
+	out["case_title"] = chosen.Title
+	out["case_url"] = caseURL
+	logStep("[cloud-practice] 选定案例: %s (%s)", chosen.Title, chosen.ID)
+
+	// 记录本次案例 ID（下次轮换避开）
+	defer saveLastCase(chosen.ID)
+
+	// 2) 打开案例详情页
+	if _, err := page.Goto(caseURL, playwright.PageGotoOptions{
 		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
 		Timeout:   playwright.Float(90000),
 	}); err != nil {
 		return nil, fmt.Errorf("打开案例详情失败: %v", err)
 	}
 	page.WaitForTimeout(8000)
-	logStep("[cloud-practice] 已打开案例详情页")
+	// 从详情页读真实「案例公仓」URL，覆盖占位值
+	repoURL := ""
+	raw, _ := page.Evaluate(`() => {
+		const a = [...document.querySelectorAll('a[href]')].find(x =>
+			/harmony-practice-center/.test(x.href) && /\.git$/.test(x.href));
+		return a ? a.href : '';
+	}`)
+	repoURL, _ = raw.(string)
+	if repoURL != "" {
+		chosen.PublicRepo = repoURL
+		logStep("[cloud-practice] 案例公仓: %s", repoURL)
+	}
 
 	// 2) 点「云端实践」主按钮 → ExpectPopup 拿新窗口
 	popup, err := page.ExpectPopup(func() error {
@@ -127,7 +163,8 @@ func RunCloudPractice(headless bool) (map[string]any, error) {
 	}
 	ta := chatFrame.Locator(`textarea.chat-textarea`).First()
 	_ = ta.Click()
-	_ = ta.PressSequentially(buildPrompt, playwright.LocatorPressSequentiallyOptions{Delay: playwright.Float(5)})
+	prompt := fmt.Sprintf(buildPromptTpl, chosen.PublicRepo)
+	_ = ta.PressSequentially(prompt, playwright.LocatorPressSequentiallyOptions{Delay: playwright.Float(5)})
 	popup.WaitForTimeout(1000)
 	if val, _ := ta.InputValue(); strings.TrimSpace(val) == "" {
 		return nil, fmt.Errorf("编译口令未填入输入框")
@@ -318,6 +355,94 @@ func pickFreeDevSpaceLink(page playwright.Page) playwright.Locator {
 		}
 	}
 	return all.Last()
+}
+
+// harmonyPracticeCase 案例列表条目（从案例页 DOM 抓）。
+type harmonyPracticeCase struct {
+	ID         string
+	Title      string
+	PublicRepo string
+}
+
+// pickNextCase 从案例列表页挑一个与上次不同的案例。
+// 优先标题含「数独/入门/纯端侧」的（编译快），否则取第一个不同于上次的。
+func pickNextCase(page playwright.Page) (harmonyPracticeCase, error) {
+	lastID := readLastCase()
+	raw, err := page.Evaluate(`() => {
+		const out = [];
+		for (const a of document.querySelectorAll('a[href]')) {
+			const m = (a.getAttribute('href')||'').match(/\/cases\/([0-9a-f]{32})/);
+			if (!m) continue;
+			let card = a;
+			for (let i=0;i<5 && card;i++) card = card.parentElement || card;
+			const title = (card ? card.innerText : '').split('\n')[0].trim().slice(0,120);
+			out.push({id:m[1], title:title});
+		}
+		const seen = new Set();
+		return out.filter(x=>{if(seen.has(x.id))return false;seen.add(x.id);return true;});
+	}`)
+	if err != nil {
+		return harmonyPracticeCase{}, err
+	}
+	items, _ := raw.([]any)
+	if len(items) == 0 {
+		return harmonyPracticeCase{}, fmt.Errorf("案例列表为空")
+	}
+	var candidates []harmonyPracticeCase
+	for _, it := range items {
+		m, _ := it.(map[string]any)
+		if m == nil { continue }
+		id, _ := m["id"].(string)
+		title, _ := m["title"].(string)
+		if id == "" { continue }
+		candidates = append(candidates, harmonyPracticeCase{ID: id, Title: title})
+	}
+	if len(candidates) == 0 {
+		return harmonyPracticeCase{}, fmt.Errorf("未解析到案例")
+	}
+	// 优先：不同于上次 + 标题含快速关键词
+	for _, c := range candidates {
+		if c.ID == lastID { continue }
+		if strings.Contains(c.Title, "数独") || strings.Contains(c.Title, "入门") || strings.Contains(c.Title, "纯端侧") {
+			c.PublicRepo = publicRepoForCase(c.ID, c.Title)
+			return c, nil
+		}
+	}
+	// 兜底：第一个不同于上次的
+	for _, c := range candidates {
+		if c.ID == lastID { continue }
+		c.PublicRepo = publicRepoForCase(c.ID, c.Title)
+		return c, nil
+	}
+	// 只有一个案例（跟上次相同），仍然用它
+	c := candidates[0]
+	c.PublicRepo = publicRepoForCase(c.ID, c.Title)
+	return c, nil
+}
+
+// publicRepoForCase 根据案例构造公仓 URL。
+// 已知案例用映射；未知案例走通用命名 harmony-practice-center/Harmony-APP-<关键词>。
+func publicRepoForCase(id, title string) string {
+	known := map[string]string{
+		"c0043e1e9d0240d19c23fa2556d5ecfc": "https://gitcode.com/harmony-practice-center/Harmony-APP-sudoku.git",
+	}
+	if u, ok := known[id]; ok { return u }
+	// 通用：从详情页拿（这里先给占位，后续可由详情页「案例公仓」字段覆盖）
+	return "https://gitcode.com/harmony-practice-center/Harmony-APP-" + id[:8] + ".git"
+}
+
+func lastCasePath() string { return filepath.Join(config.DataDir(), lastCaseFile) }
+
+func readLastCase() string {
+	b, err := os.ReadFile(lastCasePath())
+	if err != nil { return "" }
+	return strings.TrimSpace(string(b))
+}
+
+func saveLastCase(id string) {
+	_ = os.MkdirAll(filepath.Dir(lastCasePath()), 0o755)
+	_ = os.WriteFile(lastCasePath(), []byte(id), 0o644)
+	logStep("[cloud-practice] 已记录本次案例 %s", id)
 }
 
 // clipRunes 按 rune 截断，避免中文被截成半个字。
