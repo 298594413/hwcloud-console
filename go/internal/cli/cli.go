@@ -186,11 +186,19 @@ func fail(err error) int {
 	return 2
 }
 
-// ensureSession 在任务命令前自愈会话：失效时用 refresh token 自动续期。
+// ensureSession 在任务命令前自愈会话。
+// 两步：1) refresh token 自动续期；2) 续期失败则用账密自动重登兜底。
 // 失败不阻断命令本身——让真正的请求去报错，比在这里猜更有信息量。
 func ensureSession() {
 	if err := task.EnsureSession(); err != nil {
-		fmt.Fprintf(os.Stderr, "[!] 会话自愈失败：%v\n", err)
+		fmt.Fprintf(os.Stderr, "[!] 会话自愈(refresh)失败：%v\n", err)
+		// refresh token 也过期时，用账号存的手机号+密码自动重登。
+		// cliAutoLogin 内部已保护：无密码 / 关闭自动保活 / 需短信 都会跳过。
+		if ok, msg := cliAutoLogin(); ok {
+			fmt.Fprintf(os.Stderr, "[*] 账密自动重登成功：%s\n", msg)
+		} else {
+			fmt.Fprintf(os.Stderr, "[!] 账密自动重登未生效：%s\n", msg)
+		}
 	}
 }
 
