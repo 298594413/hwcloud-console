@@ -110,7 +110,10 @@ func RunGalleryPublish(opts GalleryOptions) (*GalleryResult, error) {
 			"【必须】在 /root/workspace 下新建项目目录，写 index.html（内联 CSS/JS），" +
 			"再写一个 README.md，然后 git init 并提交一次。" +
 			"不要用 npm、不要搭构建链、不要写多个源文件。" +
-			"写完后用 python3 -m http.server 8000 启动并把访问地址告诉我。"
+			"写完后不要停、不要等我确认，立刻接着执行下面两件事：\n" +
+			"1) 运行: npx skills add https://gitcode.com/Lingxi-HandsOn/gallery.git --skill huawei-cloud-publish-work-to-gallery -y 2>&1\n" +
+			"2) 装好后立刻按 skill 说明把刚做好的项目发布至开发者作品展览馆，投递当前进行中的活动。" +
+			"遇到需要登录 GitCode 就输出登录链接后停下来等我授权，不要再写代码、不要重新生成项目。"
 	}
 	if opts.ActivityIndex <= 0 {
 		opts.ActivityIndex = 1
@@ -168,45 +171,14 @@ func RunGalleryPublish(opts GalleryOptions) (*GalleryResult, error) {
 	if err := ensureChatReady(page, shell, deadline); err != nil {
 		return nil, fmt.Errorf("等待输入框失败: %v", err)
 	}
-	logStep("1/4 发送创作口令")
+	// 创作 + 装 skill + 发布 合并为一条消息一次发出。
+	// 分开发会让 AI 停下来等确认、排队、跑偏，逐条等待也极慢。
+	// 一条发完后只需等最终的 GitCode 登录链接（步骤3）。
+	logStep("1/4 发送创作+发布合并口令（一条）")
 	if err := sendToAIShell(page, shell, opts.Prompt); err != nil {
-		return nil, fmt.Errorf("发送创作口令失败: %v", err)
+		return nil, fmt.Errorf("发送合并口令失败: %v", err)
 	}
-	if err := waitForSignal(page, shell, []string{
-		"预览地址", "预览链接", "服务已启动", "启动成功",
-		"localhost:", "127.0.0.1:", "访问地址", "运行在",
-	}, deadline); err != nil {
-		return nil, fmt.Errorf("等待作品生成失败: %v", err)
-	}
-	logStep("1/4 完成：作品已生成并启动")
-
-	// ---------- 步骤 2：装 skill + 发发布指令（必须同一条消息）----------
-	//
-	// 这两句必须合并在一条消息里发。分成两条会进排队队列
-	// （用户实测截图看到「2 条排队消息」），而且 AI 收到纯命令时
-	// 不一定知道要接着做什么。
-	// 正确形态：
-	//   npx skills add ... -y 2>&1;
-	//   请将当前项目发布至开发者作品展览馆。
-	logStep("2/4 装 skill 并发发布指令")
-	// 合并成一条消息发送（用户明确要求这两句必须在同一句里）。
-	//
-	// 但只写两句话 AI 会跑偏：实测它装完 skill 又回头去写新作品，
-	// 完全没进入发布流程。所以后面追加一段硬约束，明确告诉它
-	// 装完就地执行发布、不要再写代码。
-	installCmd := "npx skills add https://gitcode.com/Lingxi-HandsOn/gallery.git " +
-		"--skill huawei-cloud-publish-work-to-gallery -y 2>&1;\n" +
-		"请将当前项目发布至开发者作品展览馆。\n" +
-		"（注意：作品已经做好了，不要再写代码、不要重新生成项目。" +
-		"装完这个 skill 后，立刻按它的说明执行发布流程，" +
-		"遇到需要登录 GitCode 就输出登录链接后停下来等我授权。）"
-	if err := waitForInputIdle(page, shell, deadline); err != nil {
-		return nil, fmt.Errorf("等待输入框就绪失败: %v", err)
-	}
-	if err := sendToAIShell(page, shell, installCmd); err != nil {
-		return nil, fmt.Errorf("发送 skill+发布指令失败: %v", err)
-	}
-	logStep("2/4 已发送（命令 + 发布指令合并为一条）")
+	logStep("1/4 已发送：AI 将创作→装skill→发布一趟完成")
 
 	// ---------- 步骤 3：等 AI 发起 GitCode OAuth，本机完成授权 ----------
 	//
