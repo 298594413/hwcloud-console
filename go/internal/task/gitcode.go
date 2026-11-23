@@ -316,34 +316,37 @@ func CreateIssue(title, body, template string, headless, dryRun bool) (map[strin
 	// 400 {"error_message":"There are other participants"}，页面上「删除 issue」
 	// 按钮也会变成 disabled。误发的 Issue 只能 PUT {state_event:"close"} 关掉。
 	// 这也是为什么要靠 weeklyMissionDone 先查重 —— 发出去就收不回来了。
-	resp, err := page.ExpectResponse(regexp.MustCompile(`/issuepr/api/v1/issue/[^/]+/issues(\?|$)`), func() error {
-		return clickIssueSubmit(page)
-	}, playwright.PageExpectResponseOptions{Timeout: playwright.Float(90000)})
-	if err != nil {
+	// 不用 ExpectResponse 匹配接口 —— GitCode 会先发列表 GET（返回 {all,issues...}），
+	// 正则容易抓错那个空列表，导致「提交成功却报 iid=0」。改为点提交后轮询页面 URL：
+	// 成功后前端跳到 /issues/<iid>，从 URL 捞 iid 最可靠。
+	beforeURL := page.URL()
+	if err := clickIssueSubmit(page); err != nil {
 		return nil, err
 	}
-	var data map[string]any
-	if err := resp.JSON(&data); err != nil {
-		return nil, err
-	}
-	iid := toInt(data["iid"])
-	// 提交成功后前端会跳到 /issues/<iid>。响应体结构不稳定（有时包一层 data），
-	// iid 拿不到就从 URL 里捞，避免「提交成功却报 iid=0」。
-	if iid == 0 {
-		if m := regexp.MustCompile(`/issues/(\d+)`).FindStringSubmatch(page.URL()); len(m) == 2 {
+	iid := 0
+	for i := 0; i < 90; i++ { // 最多 90 秒
+		page.WaitForTimeout(1000)
+		u := page.URL()
+		if m := regexp.MustCompile(`/issues/(\d+)`).FindStringSubmatch(u); len(m) == 2 {
 			iid = toInt(m[1])
+			if iid > 0 {
+				break
+			}
+		}
+		// 有些情况不跳 URL 但出现成功提示
+		if i > 5 && u != beforeURL && !strings.Contains(u, "/issues/create") {
+			if m := regexp.MustCompile(`/issues/(\d+)`).FindStringSubmatch(u); len(m) == 2 {
+				iid = toInt(m[1])
+				break
+			}
 		}
 	}
-	if iid == 0 {
-		if inner, ok := data["data"].(map[string]any); ok {
-			iid = toInt(inner["iid"])
-		}
-	}
-	result := map[string]any{"iid": iid, "response": data}
+	result := map[string]any{"iid": iid, "final_url": page.URL()}
 	if iid > 0 {
 		result["url"] = fmt.Sprintf("https://gitcode.com/%s/issues/%d", config.GitCodeRepo, iid)
+		return result, nil
 	}
-	return result, nil
+	return nil, fmt.Errorf("Issue 提交后未检测到成功（当前 %s）", page.URL())
 }
 // clickIssueSubmit 点击 Issue 编辑页的「提交」按钮。
 //
