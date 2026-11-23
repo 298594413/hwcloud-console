@@ -708,7 +708,7 @@ func findDevstationPage(ctx playwright.BrowserContext) playwright.Page {
 func navigateFromGrowthCenter(ctx playwright.BrowserContext, page playwright.Page) error {
 	logStep("  从成长中心进入（真实跳转链路）")
 
-	if _, err := page.Goto("https://developer.huaweicloud.com/grow",
+	if _, err := page.Goto("https://grow.developer.huaweicloud.com/",
 		playwright.PageGotoOptions{
 			WaitUntil: playwright.WaitUntilStateDomcontentloaded,
 			Timeout:   playwright.Float(90000),
