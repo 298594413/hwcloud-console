@@ -162,6 +162,11 @@ func RunCloudPractice(headless bool) (map[string]any, error) {
 		page.WaitForTimeout(20000)
 	}
 
+	// 上报触发后立即关机，避免环境空转持续消耗核时额度。
+	// 关机按钮没有文字，只有 title="关机"；点后弹「是否确定关机？」需点「确认」。
+	shutdownOK := shutdownDevSpace(page)
+	logStep("[cloud-practice] 关机: %v", shutdownOK)
+
 	msg := "环境未在 12 分钟内就绪（DevSpace 侧较慢，可稍后重试）"
 	if ready {
 		msg = "环境已就绪，云端实践已触发"
@@ -171,12 +176,56 @@ func RunCloudPractice(headless bool) (map[string]any, error) {
 		"agreed":           agreed,
 		"env_ready":        ready,
 		"dismissed_upgrade": dismissedUpgrade,
+		"shutdown":         shutdownOK,
 		"msg":              msg,
 	}
 	if !ready && lastText != "" {
 		out["page_hint"] = clipRunes(lastText, 300)
 	}
 	return out, nil
+}
+
+// shutdownDevSpace 关闭 DevSpace 环境，避免空转持续消耗核时额度。
+// 关机按钮没有文字，只有 title="关机"；点后弹「是否确定关机？」需点「确认」。
+func shutdownDevSpace(page playwright.Page) bool {
+	defer func() { _ = recover() }() // 关机失败不影响主流程结果
+	for _, f := range page.Frames() {
+		btn := f.Locator(`[title="关机"]`)
+		n, _ := btn.Count()
+		if n == 0 {
+			continue
+		}
+		if vis, _ := btn.First().IsVisible(); !vis {
+			continue
+		}
+		if err := btn.First().Click(playwright.LocatorClickOptions{Timeout: playwright.Float(6000)}); err != nil {
+			// 可能确认框已弹出挡住按钮，直接走确认逻辑
+			logStep("  点击关机按钮: %v（尝试直接确认）", err)
+		}
+		page.WaitForTimeout(1500)
+		// 确认弹窗：是否确定关机？ 取消 / 确认
+		for _, label := range []string{"确认", "确定"} {
+			cf := f.Locator(`.shutdown-confirm-dialog button:has-text("` + label + `")`)
+			if cn, _ := cf.Count(); cn > 0 {
+				if vis, _ := cf.First().IsVisible(); vis {
+					if err := cf.First().Click(playwright.LocatorClickOptions{Timeout: playwright.Float(6000)}); err == nil {
+						page.WaitForTimeout(3000)
+						logStep("  已确认关机")
+						return true
+					}
+				}
+			}
+		}
+		// 兜底：任意确认框里的确认按钮
+		cf := f.Locator(`[class*="confirm"] button:has-text("确认")`)
+		if cn, _ := cf.Count(); cn > 0 {
+			if err := cf.First().Click(playwright.LocatorClickOptions{Timeout: playwright.Float(5000)}); err == nil {
+				page.WaitForTimeout(3000)
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // clipRunes 按 rune 截断，避免中文被截成半个字。
