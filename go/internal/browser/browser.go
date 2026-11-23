@@ -37,11 +37,11 @@ func Launch(pw *playwright.Playwright, headless bool) (playwright.Browser, error
 		Headless: playwright.Bool(headless),
 		Args:     []string{"--disable-blink-features=AutomationControlled"},
 	}
-	// headless shell 是独立下载项，只装了完整 Chromium 的环境（如服务器）会因缺少它
-	// 直接启动失败；指定 channel=chromium 走完整浏览器的新无头实现。
-	if headless {
-		opts.Channel = playwright.String("chromium")
-	}
+	// Use the driver-managed Chromium directly (no channel) so it resolves
+	// through PLAYWRIGHT_BROWSERS_PATH / installed browsers. The previous
+	// channel="chromium" required a separately registered channel build and
+	// failed with "找不到 Chromium 可执行文件" on systems that only have the
+	// regular chromium-<rev> installed.
 	return pw.Chromium.Launch(opts)
 }
 
