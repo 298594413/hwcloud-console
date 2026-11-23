@@ -1,0 +1,23 @@
+name: Build Windows exe
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: Build exe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force go\bin | Out-Null
+          pushd go
+          go build -trimpath -o bin\hwcloud.exe ./cmd/hwcloud
+          popd
+          Get-Item go\bin\hwcloud.exe | Select-Object FullName,Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hwcloud-windows-exe
+          path: go/bin/hwcloud.exe
