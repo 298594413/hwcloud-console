@@ -8,7 +8,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/playwright-community/playwright-go"
@@ -280,16 +282,27 @@ func RunGalleryPublish(opts GalleryOptions) (*GalleryResult, error) {
 
 // closeGalleryBrowser 关掉指定端口的浏览器，释放内存。
 func closeGalleryBrowser(port string) {
-	out, _ := runLocal("bash", "-lc",
-		`pkill -f "remote-debugging-port=`+port+`" 2>/dev/null; sleep 1; echo done`)
-	_ = out
+	if runtime.GOOS == "windows" {
+		// Windows: find PIDs listening on the CDP port and kill them.
+		ps := fmt.Sprintf(`Get-NetTCPConnection -LocalPort %s -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }`, port)
+		_, _ = runLocal("powershell", "-NoProfile", "-Command", ps)
+	} else {
+		out, _ := runLocal("bash", "-lc",
+			`pkill -f "remote-debugging-port=`+port+`" 2>/dev/null; sleep 1; echo done`)
+		_ = out
+	}
 	logStep("  已关闭浏览器（端口 %s）", port)
 }
 
 // ensureGalleryBrowser 确保常驻 Chromium 在跑。
+func cdpReady(port string) bool {
+	out, _ := runLocal("curl", "-s", "-o", os.DevNull, "-w", "%{http_code}",
+		"--max-time", "3", "http://127.0.0.1:"+port+"/json/version")
+	return strings.TrimSpace(out) == "200"
+}
+
 func ensureGalleryBrowser(profile, port string) error {
-	if out, _ := runLocal("curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-		"--max-time", "3", "http://127.0.0.1:"+port+"/json/version"); strings.TrimSpace(out) == "200" {
+	if cdpReady(port) {
 		return nil
 	}
 	chrome := findGalleryChrome()
@@ -297,23 +310,36 @@ func ensureGalleryBrowser(profile, port string) error {
 		return fmt.Errorf("找不到 Chromium 可执行文件")
 	}
 	_ = os.MkdirAll(profile, 0o755)
-	_ = os.MkdirAll("/opt/hwcloud-demo/_probe", 0o755)
 
-	// setsid + nohup：脱离当前进程组，AI 任务不会随调用方退出而被杀
-	cmd := fmt.Sprintf(
-		`setsid nohup %q --remote-debugging-port=%s --remote-allow-origins='*' `+
-			`--no-first-run --no-default-browser-check --no-sandbox --disable-dev-shm-usage `+
-			`--user-data-dir=%s --window-size=1600,1000 about:blank `+
-			`> /opt/hwcloud-demo/_probe/chrome.log 2>&1 < /dev/null &`,
-		chrome, port, profile)
-	if _, err := runLocal("bash", "-lc", "export DISPLAY=:99; "+cmd); err != nil {
-		return fmt.Errorf("启动浏览器失败: %v", err)
+	args := []string{
+		"--remote-debugging-port=" + port,
+		"--remote-allow-origins=*",
+		"--no-first-run", "--no-default-browser-check", "--no-sandbox",
+		"--disable-dev-shm-usage", "--user-data-dir=" + profile,
+		"--window-size=1600,1000", "about:blank",
+	}
+	if runtime.GOOS == "windows" {
+		c := exec.Command(chrome, args...)
+		c.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x00000008 | 0x00000200} // DETACHED_PROCESS|CREATE_NO_WINDOW
+		if err := c.Start(); err != nil {
+			return fmt.Errorf("启动浏览器失败: %v", err)
+		}
+	} else {
+		_ = os.MkdirAll("/opt/hwcloud-demo/_probe", 0o755)
+		cmd := fmt.Sprintf(
+			`setsid nohup %q --remote-debugging-port=%s --remote-allow-origins='*' `+
+				`--no-first-run --no-default-browser-check --no-sandbox --disable-dev-shm-usage `+
+				`--user-data-dir=%s --window-size=1600,1000 about:blank `+
+				`> /opt/hwcloud-demo/_probe/chrome.log 2>&1 < /dev/null &`,
+			chrome, port, profile)
+		if _, err := runLocal("bash", "-lc", "export DISPLAY=:99; "+cmd); err != nil {
+			return fmt.Errorf("启动浏览器失败: %v", err)
+		}
 	}
 
 	for i := 0; i < 25; i++ {
 		time.Sleep(time.Second)
-		if out, _ := runLocal("curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-			"--max-time", "2", "http://127.0.0.1:"+port+"/json/version"); strings.TrimSpace(out) == "200" {
+		if cdpReady(port) {
 			return nil
 		}
 	}
@@ -321,13 +347,28 @@ func ensureGalleryBrowser(profile, port string) error {
 }
 
 func findGalleryChrome() string {
-	for _, p := range []string{
+	cands := []string{
 		"/opt/hwcloud-demo/browsers/chromium-1228/chrome-linux64/chrome",
 		"/opt/hwcloud-demo/browsers/chromium-1228/chrome-linux/chrome",
-		"/usr/bin/google-chrome",
-		"/usr/bin/google-chrome-stable",
-		"/opt/google/chrome/chrome",
-	} {
+		"/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/opt/google/chrome/chrome",
+	}
+	if runtime.GOOS == "windows" {
+		if base := os.Getenv("PLAYWRIGHT_BROWSERS_PATH"); base != "" {
+			for _, rev := range []string{"chromium-1228", "chromium-1243"} {
+				cands = append([]string{
+					filepath.Join(base, rev, "chrome-win64", "chrome.exe"),
+					filepath.Join(base, rev, "chrome-win", "chrome.exe"),
+				}, cands...)
+			}
+		}
+		if la := os.Getenv("LOCALAPPDATA"); la != "" {
+			cands = append([]string{
+				filepath.Join(la, "Google", "Chrome", "Application", "chrome.exe"),
+				filepath.Join(la, "Microsoft", "Edge", "Application", "msedge.exe"),
+			}, cands...)
+		}
+	}
+	for _, p := range cands {
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}
