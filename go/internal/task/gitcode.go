@@ -238,15 +238,32 @@ func CreateIssue(title, body, template string, headless, dryRun bool) (map[strin
 		if index >= n {
 			index = 0
 		}
-		if err := buttons.Nth(index).Click(); err != nil {
-			return nil, err
-		}
-		// 点完还要等编辑器渲染
-		for i := 0; i < 20; i++ {
-			if count(page.Locator(`input[placeholder*="标题"], input[placeholder*="title" i]`)) > 0 {
-				break
+		// 点模板 → 等编辑器渲染。前端路由跳转偶发第一次点击不生效，
+		// 没进编辑器就重新定位按钮再点，最多 3 轮（每轮等 8 秒）。
+		enteredEditor := false
+		for round := 0; round < 3 && !enteredEditor; round++ {
+			if round > 0 {
+				// 重新定位（页面可能已重渲染），仍优先同类模板按钮
+				buttons = page.Locator(`button:has-text("使用该模板"), button:has-text("Use this template")`)
+				n = count(buttons)
+				if n == 0 {
+					break
+				}
+				if index >= n {
+					index = 0
+				}
 			}
-			page.WaitForTimeout(1000)
+			_ = buttons.Nth(index).Click(playwright.LocatorClickOptions{Timeout: playwright.Float(8000)})
+			for i := 0; i < 8; i++ {
+				if count(page.Locator(`input[placeholder*="标题"], input[placeholder*="title" i]`)) > 0 {
+					enteredEditor = true
+					break
+				}
+				page.WaitForTimeout(1000)
+			}
+			if !enteredEditor {
+				fmt.Printf("[*] 第 %d 次点模板未进编辑器，重试\n", round+1)
+			}
 		}
 	}
 
